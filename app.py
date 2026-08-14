@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Zampto 自动续期 v4 - 纯 API 模式
-参考: weikkadd/zampto (pure API approach)
+Zampto 自动续期 v3 - SeleniumBase UC 模式
+参考: akimify/Zampto-Renew + guanxi660-crypto/zampto-renew-actions
 
 策略:
-  1. 用 ZAMTO_COOKIE（cf_clearance + zampto_session + zampto_csrf）注入 requests.Session
-  2. 通过 API 直接调用 /api/server/renew 续期
-  3. 完全绕过浏览器，避免 Cloudflare Turnstile
+  1. 用 ZAMTO_COOKIE（cf_clearance + zampto_session）注入浏览器
+  2. 用 SeleniumBase UC 模式绕过 Cloudflare 检测
+  3. 通过代理（NODE_LINK / GOST_PROXY）避免数据中心 IP 被拦
+  4. 浏览器打开服务器页面，点击续期按钮
 
 环境变量:
   ZAMTO_COOKIE    必填  Cookie 字符串 "k1=v1; k2=v2"
-  SERVER_ID       可选  服务器 ID（默认 13420）
+  ZAMPTO_EMAIL    可选  登录邮箱（备选）
+  ZAMPTO_PASSWORD 可选  登录密码（备选）
+  SERVER_ID       可选  服务器 ID（默认 13421）
   TG_BOT_TOKEN    可选  Telegram 通知
   TG_CHAT_ID      可选  Telegram 通知
   ALL_PROXY       可选  HTTP 代理地址
@@ -22,16 +25,22 @@ import re
 import time
 import json
 import requests
+from seleniumbase import SB
 from datetime import datetime, timezone
 
 # ===== 配置 =====
 COOKIE_STR = (os.environ.get("ZAMTO_COOKIE") or "").strip()
+EMAIL = os.environ.get("ZAMPTO_EMAIL") or ""
+PASSWORD = os.environ.get("ZAMPTO_PASSWORD") or ""
 SERVER_ID = os.environ.get("SERVER_ID") or "13420"
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID") or ""
 PROXY = os.environ.get("ALL_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or ""
 
 BASE_URL = "https://dash.zampto.net"
+DASHBOARD_URL = f"{BASE_URL}/server?id={SERVER_ID}"
+
+_shot_no = 0
 
 # ===== Telegram 通知 =====
 def send_tg(msg, icon="ℹ️"):
@@ -49,324 +58,459 @@ def send_tg(msg, icon="ℹ️"):
     except Exception:
         pass
 
-def log(msg):
+def shot(sb, tag):
+    global _shot_no
+    _shot_no += 1
+    try:
+        sb.save_screenshot(f"{_shot_no:02d}_{tag}.png")
+    except Exception:
+        pass
+
+def log(msg, notify=False):
     local_time = time.gmtime(time.time() + 8 * 3600)
     ts = time.strftime("%H:%M:%S", local_time)
     print(f"[{ts}] {msg}", flush=True)
 
-# ===== 创建 API Session =====
-def create_api_session():
-    """从 ZAMTO_COOKIE 创建 requests.Session"""
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": f"{BASE_URL}/",
-        "Origin": BASE_URL,
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    })
+# ===== Cookie 注入 =====
+def inject_cookies(sb):
+    """注入 ZAMTO_COOKIE 到浏览器"""
+    if not COOKIE_STR:
+        log("⚠️ 未设置 ZAMTO_COOKIE，将使用邮箱密码登录")
+        return False
 
-    if PROXY:
-        s.proxies.update({"http": PROXY, "https": PROXY})
-        log(f"📌 代理: {PROXY}")
+    log("🍪 注入 ZAMTO_COOKIE...")
+    try:
+        # 用 uc_open_with_reconnect 打开页面（处理 Cloudflare 挑战）
+        sb.uc_open_with_reconnect(BASE_URL, reconnect_time=8)
+        time.sleep(3)
 
-    # 注入 Cookie
-    if COOKIE_STR:
+        # 检查是否被 Cloudflare 拦
+        page_text = sb.get_text("body") or ""
+        if "1005" in page_text or "Access denied" in page_text or "Just a moment" in page_text:
+            log("⚠️ Cloudflare 拦截，尝试刷新...")
+            sb.uc_open_with_reconnect(BASE_URL, reconnect_time=15)
+            time.sleep(3)
+
         for pair in COOKIE_STR.split(";"):
             pair = pair.strip()
             if "=" not in pair:
                 continue
             name, value = pair.split("=", 1)
             name, value = name.strip(), value.strip()
-            s.cookies.set(name, value, domain=".zampto.net", path="/")
+            try:
+                sb.add_cookie({"name": name, "value": value, "domain": ".zampto.net", "path": "/"})
+                log(f"  ✅ {name}")
+            except Exception:
+                try:
+                    sb.add_cookie({"name": name, "value": value, "domain": "dash.zampto.net", "path": "/"})
+                    log(f"  ✅ {name} (dash.zampto.net)")
+                except Exception as e:
+                    log(f"  ⚠️ {name}: {e}")
 
-    return s
+        # 刷新页面验证
+        sb.uc_open_with_reconnect(DASHBOARD_URL, reconnect_time=8)
+        time.sleep(5)
 
-# ===== 刷新 CSRF Token =====
-def refresh_csrf(api_session):
-    """从 Set-Cookie 头中获取最新的 zampto_csrf token"""
-    try:
-        # 访问任意 API 端点触发 Set-Cookie
-        r = api_session.get(f"{BASE_URL}/api/servers", timeout=10)
-        log(f"  CSRF 刷新: GET /api/servers → {r.status_code}")
+        cur_url = sb.get_current_url()
+        log(f"📌 当前 URL: {cur_url}")
 
-        # 直接从 Set-Cookie 头读取
-        set_cookies = []
-        try:
-            set_cookies = r.raw.headers.getlist("Set-Cookie")
-        except (AttributeError, KeyError):
-            if "Set-Cookie" in r.headers:
-                set_cookies = [r.headers["Set-Cookie"]]
+        if "login" in cur_url.lower() or "auth" in cur_url.lower():
+            log("⚠️ Cookie 登录失败，回退邮箱密码登录")
+            shot(sb, "cookie_fail")
+            return False
 
-        for sc in set_cookies:
-            if "zampto_csrf=" in sc.lower():
-                idx = sc.lower().index("zampto_csrf=") + len("zampto_csrf=")
-                rest = sc[idx:]
-                end = rest.find(";")
-                token = rest if end == -1 else rest[:end]
-                token = token.strip()
-                if token:
-                    log(f"  ✅ CSRF 刷新成功 (长度={len(token)})")
-                    # 更新 session 中的 cookie
-                    api_session.cookies.set("zampto_csrf", token, domain=".zampto.net", path="/")
-                    return token
+        log("✅ Cookie 登录成功！")
+        shot(sb, "cookie_ok")
+        return True
 
-        # 回退: 从 session.cookies 读取
-        for c in api_session.cookies:
-            if "csrf" in c.name.lower():
-                log(f"  ✅ CSRF 从 session.cookies (长度={len(c.value)})")
-                return c.value
-
-        log("  ⚠️ 未找到 CSRF cookie")
-        return None
     except Exception as e:
-        log(f"  ⚠️ CSRF 刷新失败: {e}")
-        return None
-
-# ===== 获取服务器信息 =====
-def get_server_info(api_session):
-    """获取服务器状态信息"""
-    info = {"status": "unknown", "expiry": None, "last_renewed": None}
-
-    # 尝试多个 API 路径获取服务器信息
-    paths = [
-        f"/api/servers",
-        f"/api/server",
-        f"/api/server/{SERVER_ID}",
-        f"/api/servers/{SERVER_ID}",
-    ]
-
-    for path in paths:
-        try:
-            url = f"{BASE_URL}{path}"
-            r = api_session.get(url, timeout=15)
-            ct = r.headers.get("content-type", "")
-            is_json = "json" in ct.lower()
-
-            log(f"  GET {path} → {r.status_code} {'JSON' if is_json else 'HTML'}")
-
-            if r.status_code == 200 and is_json:
-                data = r.json()
-                log(f"  数据: {json.dumps(data, ensure_ascii=False)[:300]}")
-
-                # 解析服务器列表
-                servers = []
-                if isinstance(data, dict):
-                    if "servers" in data:
-                        servers = data["servers"]
-                    elif "data" in data:
-                        d = data["data"]
-                        servers = d if isinstance(d, list) else [d]
-                    else:
-                        servers = [data]
-
-                # 根据 SERVER_ID 查找
-                for sv in servers:
-                    sv_id = str(sv.get("id", ""))
-                    if sv_id == str(SERVER_ID):
-                        info["status"] = sv.get("status", "unknown")
-                        info["expiry"] = sv.get("expiry")
-                        info["last_renewed"] = sv.get("last_renewed")
-                        log(f"  ✅ 找到服务器 {SERVER_ID}: status={info['status']}")
-                        return info
-
-                # 如果没找到匹配的，但只有一台服务器就默认用第一台
-                if len(servers) == 1:
-                    sv = servers[0]
-                    info["status"] = sv.get("status", "unknown")
-                    info["expiry"] = sv.get("expiry")
-                    info["last_renewed"] = sv.get("last_renewed")
-                    log(f"  ✅ 使用唯一服务器: status={info['status']}")
-                    return info
-
-                log(f"  ⚠️ 在 {path} 中未找到服务器 {SERVER_ID}")
-
-        except Exception as e:
-            log(f"  ⚠️ GET {path} 失败: {e}")
-
-    return info
-
-# ===== 续期 =====
-def renew_server(api_session):
-    """通过 API 续期服务器"""
-    log("=" * 40)
-    log("🔄 开始 API 续期...")
-    log("=" * 40)
-
-    # 1. 刷新 CSRF
-    csrf = refresh_csrf(api_session)
-    if not csrf:
-        log("❌ 无法获取 CSRF token")
+        log(f"⚠️ Cookie 注入异常: {e}")
         return False
 
-    # 2. 获取服务器信息
-    log("📋 获取服务器信息...")
-    server_info = get_server_info(api_session)
-    log(f"📋 状态: {server_info['status']}")
-    log(f"📋 到期: {server_info['expiry']}")
-    log(f"📋 上次续期: {server_info['last_renewed']}")
+# ===== 邮箱密码登录（备选） =====
+def login_with_password(sb):
+    """邮箱密码登录（备选方案）"""
+    if not EMAIL or not PASSWORD:
+        log("❌ 未配置邮箱密码，无法登录")
+        return False
 
-    # 3. 尝试续期
-    renew_url = f"{BASE_URL}/api/server/renew"
-    log(f"📌 续期 URL: {renew_url}")
+    log("🌐 打开登录页...")
+    try:
+        sb.uc_open_with_reconnect(f"{BASE_URL}/auth/login", reconnect_time=10)
+    except Exception:
+        pass
+    time.sleep(5)
 
-    # 尝试多种 body 格式
-    body_variants = [
-        {"server_id": int(SERVER_ID)},
-        {"id": int(SERVER_ID)},
-        {"serverId": int(SERVER_ID)},
-        {"server": int(SERVER_ID)},
-        {"sid": int(SERVER_ID)},
-        {"server_id": SERVER_ID},
-        {"id": SERVER_ID},
+    shot(sb, "login_page")
+
+    # 检测页面内容
+    try:
+        page_text = (sb.get_text("body") or "").lower()
+        page_title = sb.get_page_title() or ""
+        log(f"📌 页面标题: {page_title}")
+        if "1005" in page_text or "access denied" in page_text:
+            log("🚫 Cloudflare 1005: IP 被屏蔽")
+            shot(sb, "cf_blocked")
+            return False
+        if "just a moment" in page_text:
+            log("⚠️ Cloudflare 挑战中，等待...")
+            time.sleep(10)
+    except Exception:
+        pass
+
+    # 检查是否有登录表单
+    try:
+        sb.find_element('input[type="email"], input[name="email"], input[id="email"]', timeout=8)
+        log("✅ 找到登录表单")
+    except Exception:
+        log("⚠️ 未找到登录表单，可能页面未加载完整")
+        shot(sb, "no_login_form")
+        # 保存页面源码
+        try:
+            with open("login_page.html", "w") as f:
+                f.write(sb.get_page_source())
+        except Exception:
+            pass
+        return False
+
+    # 输入邮箱
+    try:
+        sb.type('input[type="email"], input[name="email"], input[id="email"]', EMAIL, timeout=5)
+        log("✅ 已输入邮箱")
+        time.sleep(1)
+    except Exception as e:
+        log(f"⚠️ 输入邮箱失败: {e}")
+
+    # 输入密码
+    try:
+        sb.type('input[type="password"], input[name="password"], input[id="password"]', PASSWORD, timeout=5)
+        log("✅ 已输入密码")
+        time.sleep(1)
+    except Exception as e:
+        log(f"⚠️ 输入密码失败: {e}")
+
+    # 尝试点击 Turnstile
+    time.sleep(2)
+    try:
+        sb.uc_gui_click_captcha()
+        log("🖱️ 已点击 Turnstile 验证")
+        time.sleep(3)
+    except Exception:
+        log("⚠️ Turnstile 点击失败，直接提交")
+
+    # 提交
+    try:
+        sb.click('button[type="submit"], button:contains("Sign in"), button:contains("Log in"), button:contains("登录")', timeout=10)
+        log("✅ 已点击登录按钮")
+    except Exception as e:
+        log(f"⚠️ 点击登录失败: {e}")
+        try:
+            sb.execute_script("document.querySelector('button[type=submit]')?.click()")
+        except Exception:
+            pass
+
+    time.sleep(5)
+    shot(sb, "login_done")
+
+    cur_url = sb.get_current_url()
+    log(f"📌 登录后 URL: {cur_url}")
+    if "login" in cur_url.lower() or "auth" in cur_url.lower():
+        log("❌ 登录失败")
+        return False
+    log("✅ 登录成功！")
+    return True
+
+# ===== 续期 =====
+def renew_server(sb):
+    """在浏览器中点击续期按钮"""
+    server_url = f"{BASE_URL}/server?id={SERVER_ID}"
+    log(f"🌐 打开服务器详情页: {server_url}")
+    try:
+        sb.uc_open_with_reconnect(server_url, reconnect_time=8)
+        time.sleep(5)
+    except Exception:
+        pass
+
+    shot(sb, "server_page")
+    cur_url = sb.get_current_url()
+    log(f"📌 当前 URL: {cur_url}")
+
+    # 如果被重定向到 /servers，说明需要先点服务器卡片
+    if "/servers" in cur_url and "id=" not in cur_url:
+        log("👆 被重定向到服务器列表，尝试点击服务器卡片...")
+        try:
+            links = sb.find_elements("a")
+            for link in links:
+                href = link.get_attribute("href") or ""
+                txt = (link.text or "").strip()
+                if "/server?id=" in href.lower() or "/server/" in href.lower():
+                    log(f"  ✅ 点击服务器: {txt}")
+                    sb.execute_script("arguments[0].click()", link)
+                    time.sleep(3)
+                    break
+        except Exception as e:
+            log(f"⚠️ 点击服务器卡片失败: {e}")
+
+        shot(sb, "server_page_after_click")
+        cur_url = sb.get_current_url()
+        log(f"📌 点击后 URL: {cur_url}")
+
+        # 如果还是列表页，退出
+        if "/server?id=" not in cur_url and "/server/" not in cur_url:
+            log("❌ 无法进入服务器详情页")
+            return False
+
+    # 查找续期按钮并记录续期前状态
+    log("🔍 查找续期按钮...")
+    renew_btn = None
+    btn_selectors = [
+        'button:contains("Renew Server")',
+        'button:contains("Renew")',
+        'button:contains("renew")',
+        'button:contains("续期")',
+        'button:contains("Extend")',
+        'button:contains("extend")',
+        'button.w-full.bg-gradient-to-r',
+        'button[data-slot="button"]:has(svg.lucide-repeat)',
     ]
 
-    for i, body in enumerate(body_variants):
+    for sel in btn_selectors:
         try:
-            # 每次 POST 前刷新 CSRF
-            fresh_csrf = refresh_csrf(api_session)
-            if not fresh_csrf:
-                continue
+            elems = sb.find_elements(sel)
+            if elems:
+                for elem in elems:
+                    txt = (elem.text or "").strip()
+                    if "renew" in txt.lower() or "续期" in txt:
+                        log(f"  找到按钮: '{txt}'")
+                        renew_btn = elem
+                        break
+                if renew_btn:
+                    break
+        except Exception:
+            continue
 
-            log(f"  🔄 尝试 [{i+1}/{len(body_variants)}]: POST /api/server/renew body={body}")
+    if not renew_btn:
+        # 遍历所有按钮文本
+        try:
+            for btn in sb.find_elements("button"):
+                txt = (btn.text or "").strip()
+                if txt and ("renew" in txt.lower() or "续期" in txt or "extend" in txt.lower()):
+                    log(f"  找到按钮文本: {txt}")
+                    renew_btn = btn
+                    break
+        except Exception:
+            pass
 
-            r = api_session.post(
-                renew_url,
-                json=body,
-                timeout=15,
-                headers={"X-CSRF-Token": fresh_csrf},
-            )
+    if not renew_btn:
+        log("❌ 未找到续期按钮")
+        shot(sb, "no_renew_btn")
+        return False
 
-            ct = r.headers.get("content-type", "")
-            is_json = "json" in ct.lower()
-            response_preview = r.text[:200] if r.text else "(empty)"
+    # 记录续期前的到期时间和上次续期时间
+    expiry_before = ""
+    last_renewed_before = ""
+    try:
+        body = sb.get_text("body") or ""
+        for line in body.split("\n"):
+            l = line.strip()
+            if "last renewed" in l.lower():
+                last_renewed_before = l
+                log(f"📋 续期前-上次续期: {l}")
+            if "expir" in l.lower():
+                expiry_before = l
+                log(f"📋 续期前-到期: {l}")
+    except Exception:
+        pass
 
-            log(f"  → {r.status_code} {'JSON' if is_json else 'HTML'}: {response_preview}")
+    # === 方案 A: 点击按钮 + 处理 Turnstile ===
+    log("🖱️ 方案A: 点击续期按钮...")
+    try:
+        sb.execute_script("arguments[0].scrollIntoView({behavior:'smooth',block:'center'});", renew_btn)
+        time.sleep(1)
+        sb.execute_script("arguments[0].click()", renew_btn)
+        log("✅ JS click 完成")
+    except Exception as e:
+        log(f"⚠️ JS click 失败: {e}")
+        try:
+            renew_btn.click()
+            log("✅ 直接 click 完成")
+        except Exception as e2:
+            log(f"❌ 点击失败: {e2}")
 
-            if r.status_code in [200, 201, 204, 202]:
-                log("🎉 续期成功！")
-                return True
+    time.sleep(3)
+    shot(sb, "renew_clicked")
 
-            # 如果返回 captcha/验证 要求，说明需要 Turnstile
-            if "captcha" in r.text.lower() or "verification" in r.text.lower() or "turnstile" in r.text.lower():
-                log("  ⚠️ API 需要 Turnstile 验证")
-                # 尝试服务器启动端点（也许续期 API 需要先启动）
+    # 循环处理 Turnstile + 检查续期结果
+    renewed = False
+    last_renewed_after = ""
+    for attempt in range(5):
+        time.sleep(4)
+        try:
+            body = (sb.get_text("body") or "").lower()
+
+            # 获取当前 last renewed 时间
+            last_renewed_now = ""
+            for line in (sb.get_text("body") or "").split("\n"):
+                l = line.strip()
+                if "last renewed" in l.lower():
+                    last_renewed_now = l
+                    break
+
+            # 检查是否有续期成功提示
+            if "just renewed" in body or "successfully renewed" in body:
+                log("🎉 检测到续期成功提示！")
+                renewed = True
                 break
 
+            # 检查是否出现 Turnstile 安全验证
+            if "security verification" in body or "complete the security" in body or "turnstile" in body or "challenge" in body:
+                log(f"⚠️ Turnstile 安全验证弹窗（尝试 #{attempt+1}/5）")
+                try:
+                    sb.uc_gui_click_captcha()
+                    log("  ✅ uc_gui_click_captcha 执行")
+                    time.sleep(5)
+                except Exception as e:
+                    log(f"  ⚠️ uc_gui_click_captcha 失败: {e}")
+                    try:
+                        sb.execute_script("""
+                            var iframe = document.querySelector('iframe[src*="turnstile"]');
+                            if (iframe && iframe.contentDocument) {
+                                var cb = iframe.contentDocument.querySelector('#checkbox, input[type=checkbox]');
+                                if (cb) { cb.click(); return 'clicked'; }
+                            }
+                            return 'no_iframe';
+                        """)
+                        log("  ✅ iframe checkbox click 执行")
+                        time.sleep(5)
+                    except Exception as e2:
+                        log(f"  ⚠️ iframe click 失败: {e2}")
+
+                # 检查续期时间是否更新（对比续期前的值）
+                if last_renewed_before and last_renewed_now and last_renewed_now != last_renewed_before:
+                    log(f"🎉 续期时间已更新: {last_renewed_now}")
+                    renewed = True
+                    break
+            else:
+                # 没有 Turnstile 弹窗，检查续期时间
+                if last_renewed_before and last_renewed_now and last_renewed_now != last_renewed_before:
+                    log(f"🎉 续期时间已更新: {last_renewed_now}")
+                    renewed = True
+                    break
+                elif last_renewed_before:
+                    log(f"⏳ 续期时间未变: {last_renewed_now or '(无)'}")
         except Exception as e:
-            log(f"  ⚠️ 请求失败: {e}")
+            log(f"  ⚠️ 检查失败: {e}")
 
-    # 4. 如果续期失败，尝试服务器启动 + 续期
-    log("=" * 40)
-    log("🔄 尝试先启动服务器再续期...")
-    log("=" * 40)
+        if renewed:
+            break
+        if attempt < 4:
+            log(f"⏳ 等待 8 秒后重试...")
+            time.sleep(8)
 
-    # 尝试启动服务器
-    start_paths = [
-        f"/api/servers/{SERVER_ID}/start",
-        f"/api/server/{SERVER_ID}/start",
-        f"/api/server/start",
-        f"/api/server/{SERVER_ID}/power",
-    ]
+    # === 方案B: 通过浏览器 JS 直接调续期 API ===
+    if not renewed:
+        log("=" * 40)
+        log("🔄 方案B: 浏览器 JS 调续期 API (同步XHR)...")
+        log("=" * 40)
 
-    for start_path in start_paths:
+        # 先找 CSRF token
+        csrf_token = ""
         try:
-            fresh_csrf = refresh_csrf(api_session)
-            if not fresh_csrf:
-                continue
-
-            start_url = f"{BASE_URL}{start_path}"
-            log(f"  🔄 尝试启动: {start_path}")
-
-            r = api_session.post(
-                start_url,
-                json={"signal": "start"},
-                timeout=15,
-                headers={"X-CSRF-Token": fresh_csrf},
-            )
-            log(f"  → {r.status_code}: {r.text[:100]}")
-
-            if r.status_code in [200, 201, 204, 202]:
-                log("  ✅ 服务器启动成功！等待 5 秒...")
-                time.sleep(5)
-                break
+            csrf_token = sb.execute_script("""
+                var m = document.cookie.match(/zampto_csrf=([^;]+)/);
+                return m ? m[1] : '';
+            """) or ""
+            if csrf_token:
+                log(f"  ✅ 获取到 CSRF token (长度={len(csrf_token)})")
+            else:
+                log("  ⚠️ 未找到 CSRF token")
         except Exception as e:
-            log(f"  ⚠️ 启动失败: {e}")
+            log(f"  ⚠️ 获取 CSRF 失败: {e}")
 
-    # 启动后再尝试续期
-    log("=" * 40)
-    log("🔄 启动后再次尝试续期...")
-    log("=" * 40)
+        for api_path in [f'/api/server/{SERVER_ID}/renew', f'/api/client/servers/{SERVER_ID}/renew',
+                         f'/server/{SERVER_ID}/renew', f'/server?id={SERVER_ID}&action=renew',
+                         f'/api/renew/{SERVER_ID}', f'/renew/{SERVER_ID}',
+                         f'/api/server/renew']:
+            try:
+                csrf_header = ''
+                if csrf_token:
+                    csrf_header = f'xhr.setRequestHeader("X-CSRF-Token", "{csrf_token}");'
+                js_code = f"""
+                    var xhr = new XMLHttpRequest();
+                    xhr.open('POST', '{api_path}', false);
+                    xhr.setRequestHeader('Content-Type', 'application/json');
+                    xhr.setRequestHeader('Accept', 'application/json');
+                    xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+                    {csrf_header}
+                    try {{
+                        xhr.send(JSON.stringify({{server_id: {SERVER_ID}}}));
+                        return JSON.stringify({{status: xhr.status, path: '{api_path}', body: xhr.responseText.substring(0, 300)}});
+                    }} catch(e) {{
+                        return JSON.stringify({{error: e.message, path: '{api_path}'}});
+                    }}
+                """
+                result = sb.execute_script(js_code)
+                log(f"📌 {api_path} → {result}")
+                if '"status":200' in result or '"status":201' in result or '"status":204' in result:
+                    log("🎉 续期 API 调用成功！")
+                    renewed = True
+                    break
+            except Exception as e:
+                log(f"⚠️ {api_path} 失败: {e}")
 
-    for i, body in enumerate(body_variants):
-        try:
-            fresh_csrf = refresh_csrf(api_session)
-            if not fresh_csrf:
-                continue
-
-            log(f"  🔄 尝试 [{i+1}/{len(body_variants)}]: POST /api/server/renew body={body}")
-
-            r = api_session.post(
-                renew_url,
-                json=body,
-                timeout=15,
-                headers={"X-CSRF-Token": fresh_csrf},
-            )
-
-            response_preview = r.text[:200] if r.text else "(empty)"
-            log(f"  → {r.status_code}: {response_preview}")
-
-            if r.status_code in [200, 201, 204, 202]:
-                log("🎉 续期成功！")
-                return True
-
-        except Exception as e:
-            log(f"  ⚠️ 请求失败: {e}")
-
-    log("❌ 所有续期尝试均失败")
-    return False
+    if renewed:
+        log("=" * 40)
+        log("🎉 续期成功！")
+        log("=" * 40)
+        send_tg("续期成功 ✅", "✅")
+        return True
+    else:
+        log("=" * 40)
+        log("❌ 续期失败")
+        log("=" * 40)
+        send_tg("续期失败，请检查面板", "❌")
+        return False
 
 # ===== 主入口 =====
 def main():
     log("=" * 40)
-    log("Zampto 自动续期 v4 (纯 API)")
+    log("Zampto 自动续期 v3 (SeleniumBase UC)")
     log("=" * 40)
 
-    if not COOKIE_STR:
-        log("❌ 请配置 ZAMTO_COOKIE")
+    if not COOKIE_STR and (not EMAIL or not PASSWORD):
+        log("❌ 请配置 ZAMTO_COOKIE 或 ZAMPTO_EMAIL + ZAMPTO_PASSWORD")
         send_tg("配置缺失，无法续期", "❌")
         return
 
-    # 创建 API session
-    api_session = create_api_session()
+    with SB(uc=True, headless2=True, incognito=False) as sb:
+        log("🚀 浏览器启动")
+        log(f"📌 代理: {PROXY or '直连'}")
 
-    # 验证 session
-    log("🔍 验证 session...")
-    try:
-        r = api_session.get(f"{BASE_URL}/auth/login", timeout=10)
-        log(f"  GET /auth/login → {r.status_code}")
-        if r.status_code == 200 and "antialiased" in r.text[:500]:
-            log("✅ Session 验证通过")
+        # 1. 尝试 Cookie 登录
+        logged_in = inject_cookies(sb)
+
+        # 2. 失败则回退邮箱密码
+        if not logged_in:
+            logged_in = login_with_password(sb)
+
+        if not logged_in:
+            log("❌ 登录失败，终止")
+            send_tg("登录失败，请检查 Cookie 或账号密码", "❌")
+            return
+
+        # 3. 续期
+        log("=" * 40)
+        result = renew_server(sb)
+
+        if result:
+            log("=" * 40)
+            log("✅ 续期流程完成")
+            log("=" * 40)
         else:
-            log("⚠️ Session 可能失效")
-            send_tg("Cookie 可能已失效，请重新获取", "⚠️")
-    except Exception as e:
-        log(f"❌ 验证请求失败: {e}")
-
-    # 续期
-    result = renew_server(api_session)
-
-    if result:
-        log("=" * 40)
-        log("✅ 续期流程完成")
-        log("=" * 40)
-        send_tg("续期成功 ✅", "✅")
-    else:
-        log("=" * 40)
-        log("❌ 续期失败")
-        send_tg("续期失败，请检查服务器状态", "❌")
-        log("=" * 40)
+            log("=" * 40)
+            log("❌ 续期失败")
+            send_tg("续期失败，请检查服务器状态", "❌")
+            log("=" * 40)
 
 
 if __name__ == "__main__":
