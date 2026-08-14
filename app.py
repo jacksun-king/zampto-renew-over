@@ -318,7 +318,7 @@ def renew_server(sb):
     except Exception:
         pass
 
-    # === 方案 A: 先尝试点击按钮 ===
+    # === 方案 A: 点击按钮 + 处理 Turnstile ===
     log("🖱️ 方案A: 点击续期按钮...")
     try:
         sb.execute_script("arguments[0].scrollIntoView({behavior:'smooth',block:'center'});", renew_btn)
@@ -333,104 +333,107 @@ def renew_server(sb):
         except Exception as e2:
             log(f"❌ 点击失败: {e2}")
 
-    time.sleep(10)
+    time.sleep(3)
     shot(sb, "renew_clicked")
 
-    # 检查 Cloudflare 挑战
-    try:
-        body = (sb.get_text("body") or "").lower()
-        if "just a moment" in body or "checking your browser" in body:
-            log("⚠️ Cloudflare 挑战，等待...")
-            time.sleep(15)
-            shot(sb, "cf_after")
-    except Exception:
-        pass
-
-    # 检查是否有 Turnstile
-    try:
-        sb.uc_gui_click_captcha(timeout=5)
-        log("🖱️ 已尝试点击 Turnstile")
-        time.sleep(3)
-    except Exception:
-        pass
-
-    # 检查续期后页面
-    try:
-        body = sb.get_text("body") or ""
-        log(f"📄 续期后页面文本:")
-        for line in body.split("\n"):
-            l = line.strip()
-            if "renew" in l.lower() or "expir" in l.lower() or "last" in l.lower() or "success" in l.lower() or "error" in l.lower() or "fail" in l.lower():
-                log(f"  📋 {l}")
-    except Exception:
-        pass
-
-    # 检查续期结果
+    # 循环处理 Turnstile + 检查续期结果
     renewed = False
-    try:
-        body = sb.get_text("body") or ""
-        if "renewed" in body.lower() and "expiry" in body.lower():
-            # 有空检查续期时间是否变化
-            renewed = True
-        elif "just renewed" in body.lower():
-            renewed = True
-        elif "renewal successful" in body.lower() or "successfully renewed" in body.lower():
-            renewed = True
-    except Exception:
-        pass
+    for attempt in range(3):
+        try:
+            body = (sb.get_text("body") or "").lower()
+            # 检查是否有续期成功提示
+            if "just renewed" in body or "successfully renewed" in body:
+                log("🎉 检测到续期成功提示！")
+                renewed = True
+                break
 
-    # === 方案 B: 通过浏览器 JS 直接调 API 续期 ===
+            # 检查是否出现 Turnstile 安全验证
+            if "security verification" in body or "complete the security" in body or "turnstile" in body:
+                log(f"⚠️ Turnstile 安全验证弹窗（尝试 #{attempt+1}）")
+                # 尝试多种方式处理 Turnstile
+                try:
+                    # 方法1: uc_gui_click_captcha
+                    sb.uc_gui_click_captcha(timeout=8)
+                    log("  ✅ uc_gui_click_captcha 执行")
+                    time.sleep(5)
+                except Exception:
+                    try:
+                        # 方法2: 直接点击 iframe
+                        sb.execute_script("""
+                            document.querySelector('iframe[src*="turnstile"]')?.click();
+                            document.querySelector('[class*="challenge-container"]')?.click();
+                        """)
+                        log("  ✅ iframe JS click 执行")
+                        time.sleep(3)
+                    except Exception:
+                        pass
+
+                # 检查验证是否通过
+                body2 = (sb.get_text("body") or "").lower()
+                if "security verification" not in body2:
+                    log("  ✅ Turnstile 验证通过！")
+                    time.sleep(5)  # 等待 API 返回
+                    # 检查续期结果
+                    body3 = sb.get_text("body") or ""
+                    for line in body3.split("\n"):
+                        l = line.strip()
+                        if "last renewed" in l.lower():
+                            log(f"  📋 续期后: {l}")
+                            if "7:12" not in l:
+                                log("🎉 续期时间已更新！")
+                                renewed = True
+                                break
+            else:
+                # 没有 Turnstile 弹窗，检查续期时间
+                for line in body.split("\n"):
+                    l = line.strip()
+                    if "last renewed" in l.lower():
+                        log(f"📋 续期后: {l}")
+                        if "7:12" not in l:
+                            log("🎉 续期时间已更新！")
+                            renewed = True
+                            break
+        except Exception:
+            pass
+
+        if renewed:
+            break
+        if attempt < 2:
+            log(f"⏳ 等待 8 秒后重试...")
+            time.sleep(8)
+
+    # === 方案B: 通过浏览器 JS 直接调续期 API ===
     if not renewed:
         log("=" * 40)
-        log("🔄 方案B: 通过浏览器 JS 直接调续期 API...")
+        log("🔄 方案B: 浏览器 JS fetch 调续期 API...")
         log("=" * 40)
 
-        try:
-            # 获取 CSRF token
-            csrf_token = sb.execute_script("""
-                return document.querySelector('meta[name="csrf-token"]')?.content
-                    || document.querySelector('meta[name="csrf-param"]')?.content
-                    || '';
-            """) or ""
-            if csrf_token:
-                log(f"📌 CSRF token: {csrf_token[:20]}...")
-
-            # 获取 XSRF-TOKEN cookie
-            xsrf = sb.execute_script("""
-                return document.cookie.split('; ')
-                    .find(c => c.startsWith('XSRF-TOKEN='))
-                    ?.split('=')[1] || '';
-            """) or ""
-
-            # 尝试通过 fetch 调续期 API
-            result = sb.execute_script(f"""
-                (async () => {{
-                    try {{
-                        const resp = await fetch('/api/server/{SERVER_ID}/renew', {{
-                            method: 'POST',
-                            headers: {{
-                                'Content-Type': 'application/json',
-                                'Accept': 'application/json',
-                                'X-CSRF-TOKEN': '{csrf_token}',
-                                'X-XSRF-TOKEN': '{xsrf}',
-                            }},
-                            credentials: 'same-origin',
-                        }});
-                        const data = await resp.text();
-                        return JSON.stringify({{status: resp.status, body: data.substring(0, 500)}});
-                    }} catch(e) {{
-                        return JSON.stringify({{error: e.message}});
-                    }}
-                }})()
-            """)
-            log(f"📌 API 响应: {result}")
-            if '"status":200' in result or '"status":201' in result or '"status":204' in result:
-                log("🎉 续期 API 调用成功！")
-                renewed = True
-            elif '"status":' in result:
-                log(f"⚠️ API 返回非 200 状态码")
-        except Exception as e:
-            log(f"⚠️ 方案B 失败: {e}")
+        for api_path in [f'/api/server/{SERVER_ID}/renew', f'/api/client/servers/{SERVER_ID}/renew',
+                         f'/server/{SERVER_ID}/renew', f'/server?id={SERVER_ID}&action=renew',
+                         f'/api/renew/{SERVER_ID}', f'/renew/{SERVER_ID}']:
+            try:
+                result = sb.execute_script(f"""
+                    (async () => {{
+                        try {{
+                            const resp = await fetch('{api_path}', {{
+                                method: 'POST',
+                                headers: {{'Content-Type': 'application/json', 'Accept': 'application/json'}},
+                                credentials: 'same-origin',
+                            }});
+                            const data = await resp.text();
+                            return JSON.stringify({{status: resp.status, path: '{api_path}', body: data.substring(0, 300)}});
+                        }} catch(e) {{
+                            return JSON.stringify({{error: e.message, path: '{api_path}'}});
+                        }}
+                    }})()
+                """)
+                log(f"📌 {api_path} → {result}")
+                if '"status":200' in result or '"status":201' in result or '"status":204' in result:
+                    log("🎉 续期 API 调用成功！")
+                    renewed = True
+                    break
+            except Exception as e:
+                log(f"⚠️ {api_path} 失败: {e}")
 
     if renewed:
         log("=" * 40)
