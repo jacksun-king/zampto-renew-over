@@ -80,9 +80,16 @@ def inject_cookies(sb):
 
     log("🍪 注入 ZAMTO_COOKIE...")
     try:
-        # 先访问 domain 才能 set cookie
-        sb.open(BASE_URL, timeout=20000)
-        time.sleep(2)
+        # 用 uc_open_with_reconnect 打开页面（处理 Cloudflare 挑战）
+        sb.uc_open_with_reconnect(BASE_URL, reconnect_time=8)
+        time.sleep(3)
+
+        # 检查是否被 Cloudflare 拦
+        page_text = sb.get_text("body") or ""
+        if "1005" in page_text or "Access denied" in page_text or "Just a moment" in page_text:
+            log("⚠️ Cloudflare 拦截，尝试刷新...")
+            sb.uc_open_with_reconnect(BASE_URL, reconnect_time=15)
+            time.sleep(3)
 
         for pair in COOKIE_STR.split(";"):
             pair = pair.strip()
@@ -101,10 +108,12 @@ def inject_cookies(sb):
                     log(f"  ⚠️ {name}: {e}")
 
         # 刷新页面验证
-        sb.open(DASHBOARD_URL, timeout=30000)
-        time.sleep(3)
+        sb.uc_open_with_reconnect(DASHBOARD_URL, reconnect_time=8)
+        time.sleep(5)
 
         cur_url = sb.get_current_url()
+        log(f"📌 当前 URL: {cur_url}")
+
         if "login" in cur_url.lower() or "auth" in cur_url.lower():
             log("⚠️ Cookie 登录失败，回退邮箱密码登录")
             shot(sb, "cookie_fail")
@@ -127,33 +136,56 @@ def login_with_password(sb):
 
     log("🌐 打开登录页...")
     try:
-        sb.uc_open_with_reconnect(f"{BASE_URL}/auth/login", reconnect_time=8)
+        sb.uc_open_with_reconnect(f"{BASE_URL}/auth/login", reconnect_time=10)
     except Exception:
         pass
     time.sleep(5)
 
     shot(sb, "login_page")
 
-    # 检测 Cloudflare 拦截
+    # 检测页面内容
     try:
-        page_text = sb.get_text("body") or ""
-        if "1005" in page_text or "Access denied" in page_text:
+        page_text = (sb.get_text("body") or "").lower()
+        page_title = sb.get_page_title() or ""
+        log(f"📌 页面标题: {page_title}")
+        if "1005" in page_text or "access denied" in page_text:
             log("🚫 Cloudflare 1005: IP 被屏蔽")
+            shot(sb, "cf_blocked")
             return False
+        if "just a moment" in page_text:
+            log("⚠️ Cloudflare 挑战中，等待...")
+            time.sleep(10)
     except Exception:
         pass
 
+    # 检查是否有登录表单
+    try:
+        sb.find_element('input[type="email"], input[name="email"], input[id="email"]', timeout=8)
+        log("✅ 找到登录表单")
+    except Exception:
+        log("⚠️ 未找到登录表单，可能页面未加载完整")
+        shot(sb, "no_login_form")
+        # 保存页面源码
+        try:
+            with open("login_page.html", "w") as f:
+                f.write(sb.get_page_source())
+        except Exception:
+            pass
+        return False
+
     # 输入邮箱
     try:
-        sb.type('input[type="email"], input[name="email"], input[id="email"]', EMAIL, timeout=10)
+        sb.type('input[type="email"], input[name="email"], input[id="email"]', EMAIL, timeout=5)
         log("✅ 已输入邮箱")
+        time.sleep(1)
     except Exception as e:
         log(f"⚠️ 输入邮箱失败: {e}")
 
     # 输入密码
     try:
-        sb.type('input[type="password"], input[name="password"], input[id="password"]', PASSWORD, timeout=10)
+        sb.type('input[type="password"], input[name="password"], input[id="password"]', PASSWORD, timeout=5)
         log("✅ 已输入密码")
+        time.sleep(1)
     except Exception as e:
         log(f"⚠️ 输入密码失败: {e}")
 
@@ -162,12 +194,13 @@ def login_with_password(sb):
     try:
         sb.uc_gui_click_captcha()
         log("🖱️ 已点击 Turnstile 验证")
+        time.sleep(3)
     except Exception:
         log("⚠️ Turnstile 点击失败，直接提交")
 
     # 提交
     try:
-        sb.click('button[type="submit"], button:contains("Sign in"), button:contains("Log in")', timeout=10)
+        sb.click('button[type="submit"], button:contains("Sign in"), button:contains("Log in"), button:contains("登录")', timeout=10)
         log("✅ 已点击登录按钮")
     except Exception as e:
         log(f"⚠️ 点击登录失败: {e}")
@@ -180,6 +213,7 @@ def login_with_password(sb):
     shot(sb, "login_done")
 
     cur_url = sb.get_current_url()
+    log(f"📌 登录后 URL: {cur_url}")
     if "login" in cur_url.lower() or "auth" in cur_url.lower():
         log("❌ 登录失败")
         return False
@@ -287,8 +321,9 @@ def main():
         send_tg("配置缺失，无法续期", "❌")
         return
 
-    with SB(uc=True, headless2=True) as sb:
+    with SB(uc=True, headless2=True, incognito=False) as sb:
         log("🚀 浏览器启动")
+        log(f"📌 代理: {PROXY or '直连'}")
 
         # 1. 尝试 Cookie 登录
         logged_in = inject_cookies(sb)
