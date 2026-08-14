@@ -316,13 +316,13 @@ def login(sb) -> bool:
 
     # 调试：检查页面是否包含 Turnstile 相关元素
     ts_check = sb.execute_script("""
-        return JSON.stringify({
-            hasTurnstileInput: !!document.querySelector('input[name="cf-turnstile-response"]'),
-            hasChallengesCDN: document.documentElement.innerHTML.includes('challenges.cloudflare.com'),
-            hasCfTurnstile: document.documentElement.innerHTML.includes('cf-turnstile'),
-            pageUrl: window.location.href,
-            bodyLen: (document.body && document.body.innerHTML.length) || 0
-        });
+        var hasInput = !!document.querySelector('input[name="cf-turnstile-response"]');
+        var html = document.documentElement.innerHTML;
+        var hasCDN = html.indexOf('challenges.cloudflare.com') !== -1;
+        var hasCf = html.indexOf('cf-turnstile') !== -1;
+        var url = window.location.href;
+        var bodyLen = (document.body && document.body.innerHTML.length) || 0;
+        return JSON.stringify({hasInput:hasInput, hasCDN:hasCDN, hasCf:hasCf, url:url, bodyLen:bodyLen});
     """)
     print(f"🔍 页面调试信息: {ts_check}")
 
