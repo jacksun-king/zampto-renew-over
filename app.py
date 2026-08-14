@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 COOKIE_STR = (os.environ.get("ZAMTO_COOKIE") or "").strip()
 EMAIL = os.environ.get("ZAMPTO_EMAIL") or ""
 PASSWORD = os.environ.get("ZAMPTO_PASSWORD") or ""
-SERVER_ID = os.environ.get("SERVER_ID") or "13421"
+SERVER_ID = os.environ.get("SERVER_ID") or "13420"
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID") or ""
 PROXY = os.environ.get("ALL_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or ""
@@ -223,78 +223,37 @@ def login_with_password(sb):
 # ===== 续期 =====
 def renew_server(sb):
     """在浏览器中点击续期按钮"""
-    # 先打开服务器列表
-    log("🌐 打开服务器列表...")
+    server_url = f"{BASE_URL}/server?id={SERVER_ID}"
+    log(f"🌐 打开服务器详情页: {server_url}")
     try:
-        sb.open(f"{BASE_URL}/servers", timeout=20000)
+        sb.open(server_url, timeout=20000)
         time.sleep(3)
     except Exception:
         pass
-    shot(sb, "servers_list")
-
-    # 如果当前在服务器列表，点击第一个服务器卡片进入详情
-    cur_url = sb.get_current_url()
-    log(f"📌 当前 URL: {cur_url}")
-
-    if "/servers" in cur_url and "id=" not in cur_url:
-        log("👆 在服务器列表页，尝试点击服务器卡片...")
-        try:
-            # 查找服务器卡片或链接
-            card_selectors = [
-                'a[href*="/server/"]',
-                'a[href*="/server?id="]',
-                'a[href*="/servers/"]',
-                'a:has(h3), a:has(h4)',
-                'div[role="button"]:has(h3), div[role="button"]:has(h4)',
-                'div.cursor-pointer',
-                'div.card, div[class*="card"]',
-            ]
-            clicked = False
-            for sel in card_selectors:
-                try:
-                    elem = sb.find_element(sel, timeout=3)
-                    if elem:
-                        sb.click(sel)
-                        log(f"  ✅ 点击: {sel}")
-                        clicked = True
-                        time.sleep(3)
-                        break
-                except Exception:
-                    continue
-
-            if not clicked:
-                # 尝试点击整个页面中的第一个可点击的卡片
-                try:
-                    # 找所有链接
-                    links = sb.find_elements("a")
-                    for link in links:
-                        href = link.get_attribute("href") or ""
-                        txt = (link.text or "").strip()
-                        if "/server" in href.lower() and txt:
-                            sb.execute_script("arguments[0].click()", link)
-                            log(f"  ✅ 点击链接: {txt}")
-                            clicked = True
-                            time.sleep(3)
-                            break
-                except Exception:
-                    pass
-
-            if not clicked:
-                log("⚠️ 未找到服务器卡片，尝试直接打开服务器详情页")
-                for url_try in [f"{BASE_URL}/server?id={SERVER_ID}", f"{BASE_URL}/server/{SERVER_ID}"]:
-                    try:
-                        sb.open(url_try, timeout=20000)
-                        time.sleep(3)
-                        break
-                    except Exception:
-                        continue
-
-        except Exception as e:
-            log(f"⚠️ 点击服务器卡片失败: {e}")
 
     shot(sb, "server_page")
     cur_url = sb.get_current_url()
-    log(f"📌 服务器页 URL: {cur_url}")
+    log(f"📌 当前 URL: {cur_url}")
+
+    # 如果被重定向到 /servers，说明需要先点服务器卡片
+    if "/servers" in cur_url and "id=" not in cur_url:
+        log("👆 被重定向到服务器列表，尝试点击服务器卡片...")
+        try:
+            links = sb.find_elements("a")
+            for link in links:
+                href = link.get_attribute("href") or ""
+                txt = (link.text or "").strip()
+                if "/server?id=" in href.lower() or "/server/" in href.lower():
+                    log(f"  ✅ 点击服务器: {txt}")
+                    sb.execute_script("arguments[0].click()", link)
+                    time.sleep(3)
+                    break
+        except Exception as e:
+            log(f"⚠️ 点击服务器卡片失败: {e}")
+
+        shot(sb, "server_page_after_click")
+        cur_url = sb.get_current_url()
+        log(f"📌 点击后 URL: {cur_url}")
 
     # 查找续期按钮
     log("🔍 查找续期按钮...")
