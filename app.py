@@ -5,6 +5,7 @@ import os
 import time
 import subprocess
 import requests
+import base64
 from seleniumbase import SB
 
 # ===== 从环境变量获取配置 =====
@@ -48,6 +49,23 @@ def send_tg_message(status_icon, status_text, detail=""):
             print(f"⚠️ Telegram 通知发送失败: {r.text}")
     except Exception as e:
         print(f"⚠️ Telegram 通知异常: {e}")
+
+def send_tg_photo(filepath, caption=""):
+    """发送截图到 Telegram 用于调试"""
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
+        with open(filepath, "rb") as f:
+            files = {"photo": f}
+            data = {"chat_id": TG_CHAT_ID, "caption": caption[:200]}
+            r = requests.post(url, files=files, data=data, timeout=15)
+            if r.status_code == 200:
+                print("📸 截图已发送到 Telegram")
+            else:
+                print(f"⚠️ 截图发送失败: {r.text}")
+    except Exception as e:
+        print(f"⚠️ 截图发送异常: {e}")
 
 # ===== Turnstile / 验证码处理 JS =====
 _EXPAND_JS = """
@@ -126,18 +144,6 @@ def _activate_window():
         except Exception:
             pass
 
-def _xdotool_click(x, y):
-    _activate_window()
-    try:
-        subprocess.run(
-            ["xdotool", "mousemove", "--sync", str(x), str(y)],
-            timeout=3, stderr=subprocess.DEVNULL
-        )
-        time.sleep(0.15)
-        subprocess.run(["xdotool", "click", "1"], timeout=2, stderr=subprocess.DEVNULL)
-    except Exception:
-        os.system(f"xdotool mousemove {x} {y} click 1 2>/dev/null")
-
 def handle_turnstile(sb) -> bool:
     print("🔍 处理 Cloudflare Turnstile 验证...")
     time.sleep(2)
@@ -168,37 +174,105 @@ def handle_turnstile(sb) -> bool:
     print(" ❌ Turnstile 6 次均失败")
     return False
 
+def wait_for_login_form(sb, timeout=60):
+    """等待登录表单加载，支持 Cloudflare 挑战页面和正常登录页面"""
+    print(f"⏳ 等待页面加载（最长 {timeout}s）...")
+    for i in range(timeout):
+        try:
+            # 检查页面标题/内容
+            title = sb.get_page_title() or ""
+            page_src = (sb.get_page_source() or "").lower()
+
+            # 检查是否还在 Cloudflare 挑战页
+            if 'just a moment' in page_src.lower() or 'checking your browser' in page_src.lower():
+                print(f"🔄 第 {i+1}s: 仍在 Cloudflare 验证中...")
+                time.sleep(1)
+                continue
+
+            # 检查是否出现登录表单
+            if 'input name="email"' in page_src or 'name="email"' in page_src:
+                print(f"✅ 登录表单已加载（{i+1}s）")
+                return True
+
+            # 检查是否跳转到了其他页面
+            cur_url = sb.get_current_url().split('?')[0].lower().rstrip('/')
+            login_url_lower = f"{BASE_URL}/auth/login".lower().rstrip('/')
+            if cur_url != login_url_lower and 'auth' not in cur_url:
+                print(f"✅ 已跳转到其他页面: {cur_url}（{i+1}s）")
+                return True
+
+        except Exception:
+            pass
+        time.sleep(1)
+
+    print("⚠️ 页面加载超时，尝试保存截图...")
+    try:
+        sb.save_screenshot("page_state.png")
+        send_tg_photo("page_state.png", "页面加载超时：当前页面状态")
+    except Exception:
+        pass
+    return False
+
+def has_cf_challenge(sb):
+    """检测当前页面是否是 Cloudflare 挑战页面"""
+    try:
+        title = sb.get_page_title() or ""
+        src = (sb.get_page_source() or "").lower()
+        if 'just a moment' in title.lower() or 'just a moment' in src:
+            return True
+        if 'checking your browser' in src:
+            return True
+        if 'cf-browser-verification' in src or 'challenge-platform' in src:
+            return True
+        return False
+    except Exception:
+        return False
+
 # ===== 登录 =====
 def login(sb) -> bool:
     login_url = f"{BASE_URL}/auth/login"
     print(f"🌐 打开登录页面: {login_url}")
-    sb.uc_open_with_reconnect(login_url, reconnect_time=8)
-    time.sleep(5)
 
-    # 等待 Cloudflare 验证通过
-    print("⏳ 等待 Cloudflare 验证通过...")
-    cf_passed = False
-    for i in range(30):
-        page_src = sb.get_page_source() or ""
-        if 'input name="email"' in page_src.lower() or 'name="email"' in page_src.lower():
-            cf_passed = True
-            print(f"✅ Cloudflare 验证已通过（{i+1}s）")
-            break
-        time.sleep(1)
-    if not cf_passed:
-        print("⚠️ Cloudflare 验证可能未通过，继续尝试...")
+    # 使用 uc_open_with_reconnect 处理 Cloudflare
+    # reconnect_time 每次重连等待秒数，总耗时 reconnect_time * 尝试次数
+    sb.uc_open_with_reconnect(login_url, reconnect_time=10)
+    time.sleep(3)
+
+    # 检查是否还在 Cloudflare 挑战页
+    if has_cf_challenge(sb):
+        print("⚠️ 检测到 Cloudflare 挑战页，等待处理...")
+        for i in range(30):
+            time.sleep(1)
+            if not has_cf_challenge(sb):
+                print(f"✅ Cloudflare 挑战已通过（{i+1}s）")
+                break
+            if i % 10 == 0:
+                print(f"⏳ 等待 Cloudflare 通过...（{i+1}s）")
+
+    # 等待登录表单加载
+    if not wait_for_login_form(sb, timeout=60):
+        # 尝试再次使用 uc_open_with_reconnect
+        print("🔄 首次加载失败，再次尝试 uc_open_with_reconnect...")
         try:
-            sb.wait_for_element('input[name="email"]', timeout=15)
-        except Exception:
-            try:
-                sb.wait_for_element('input[name="Email"]', timeout=5)
-            except Exception:
-                print("❌ 页面未加载出登录表单")
-                sb.save_screenshot("login_load_fail.png")
+            sb.uc_open_with_reconnect(login_url, reconnect_time=15)
+            time.sleep(5)
+            if wait_for_login_form(sb, timeout=45):
+                print("✅ 第二次尝试成功")
+            else:
+                print("❌ 页面始终未加载出登录表单")
+                try:
+                    # 打印当前页面部分内容用于调试
+                    body = sb.get_text('body')[:500]
+                    print(f"📄 页面内容: {body}")
+                except Exception:
+                    pass
                 return False
+        except Exception as e:
+            print(f"❌ 第二次打开页面失败: {e}")
+            return False
 
     # 填写邮箱
-    print(f"📧 填写邮箱...")
+    print("📧 填写邮箱...")
     js_fill_input(sb, 'input[name="email"]', EMAIL)
     time.sleep(0.3)
 
@@ -218,9 +292,7 @@ def login(sb) -> bool:
         time.sleep(1)
     if ts_found:
         if not handle_turnstile(sb):
-            print("❌ 登录界面的 Turnstile 验证失败")
-            sb.save_screenshot("login_turnstile_fail.png")
-            return False
+            print("⚠️ Turnstile 验证未通过，尝试直接提交...")
     else:
         print("ℹ️ 未检测到 Turnstile")
 
@@ -234,9 +306,9 @@ def login(sb) -> bool:
         except Exception:
             pass
 
-    # 等待登录跳转
-    print("⏳ 等待登录跳转...")
-    for _ in range(15):
+    # 等待登录跳转（最长 30 秒）
+    print("⏳ 等待登录跳转最长 30 秒...")
+    for _ in range(30):
         time.sleep(1)
         cur_url = sb.get_current_url().split('?')[0].lower().rstrip('/')
         if cur_url != login_url.rstrip('/') and 'auth' not in cur_url:
@@ -248,7 +320,11 @@ def login(sb) -> bool:
         print(f"✅ 登录成功！")
         return True
     print(f"❌ 登录失败，页面未跳转。(URL: {sb.get_current_url()})")
-    sb.save_screenshot("login_failed.png")
+    try:
+        sb.save_screenshot("login_failed.png")
+        send_tg_photo("login_failed.png", "登录失败页面截图")
+    except Exception:
+        pass
     return False
 
 # ===== 续期流程 =====
@@ -257,7 +333,6 @@ def check_renewal_info(sb) -> str:
     time.sleep(3)
     try:
         info_text = sb.get_text('body')
-        # 查找续期信息
         lines = info_text.split('\n')
         renewal_lines = []
         for line in lines:
@@ -274,8 +349,11 @@ def renew_server(sb) -> bool:
     """登录成功后进入服务器页面并触发续期"""
     server_url = f"{BASE_URL}/server?id={SERVER_ID}"
     print(f"\n🌐 打开服务器页面: {server_url}")
-    sb.uc_open_with_reconnect(server_url, reconnect_time=8)
+    sb.uc_open_with_reconnect(server_url, reconnect_time=10)
     time.sleep(5)
+
+    if not wait_for_login_form(sb, timeout=30):
+        print("⚠️ 服务器页面加载异常，继续尝试...")
 
     # 查找 Renew Server 按钮
     print("🔍 查找 Renew Server 按钮...")
@@ -296,7 +374,6 @@ def renew_server(sb) -> bool:
             continue
 
     if not renew_btn:
-        # 尝试按文本匹配
         try:
             buttons = sb.find_elements('button')
             for btn in buttons:
@@ -311,7 +388,7 @@ def renew_server(sb) -> bool:
     if not renew_btn:
         print("❌ 未找到 Renew Server 按钮")
         sb.save_screenshot("no_renew_btn.png")
-        # 先读取续期信息看看
+        send_tg_photo("no_renew_btn.png", "未找到续期按钮")
         info = check_renewal_info(sb)
         if info:
             print(f"📋 页面续期信息:\n{info}")
@@ -355,10 +432,8 @@ def renew_server(sb) -> bool:
     info = check_renewal_info(sb)
     if info:
         print(f"📋 续期信息:\n{info}")
-        # 判断续期是否成功
         info_lower = info.lower()
         if 'expir' in info_lower or 'renewed' in info_lower or 'renewal' in info_lower:
-            # 提取到期时间
             import re
             expiry_match = re.search(r'Expiry[^:]*:\s*([^\n]+)', info)
             if expiry_match:
@@ -372,7 +447,6 @@ def renew_server(sb) -> bool:
             send_tg_message("ℹ️", "续期操作已执行", info[:100])
             return True
     else:
-        # 再次读取页面文本
         time.sleep(3)
         info = check_renewal_info(sb)
         if info:
@@ -382,7 +456,8 @@ def renew_server(sb) -> bool:
         else:
             print("ℹ️ 未检测到续期信息，可能续期未生效")
             sb.save_screenshot("renew_result.png")
-            send_tg_message("⚠️", "续期结果未知", "请检查截图")
+            send_tg_photo("renew_result.png", "续期结果截图")
+            send_tg_message("⚠️", "续期结果未知", "请查看截图")
             return False
 
 # ===== 主入口 =====
@@ -417,7 +492,7 @@ def main():
             renew_server(sb)
         else:
             print("\n❌ 登录失败，终止续期操作。")
-            send_tg_message("❌", "登录失败", "请检查账号密码或 Turnstile 验证")
+            send_tg_message("❌", "登录失败", "请检查截图")
 
 if __name__ == "__main__":
     main()
