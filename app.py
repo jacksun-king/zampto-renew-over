@@ -344,26 +344,18 @@ def renew_server(sb):
             body = (sb.get_text("body") or "").lower()
             if "security verification" in body or "complete the security" in body or "turnstile" in body:
                 log(f"⏳ 检测到 Turnstile 验证弹窗 (第{i+1}次)...")
-                # 尝试处理 Turnstile
-                for method_name in ["uc_gui_click_captcha", "uc_gui_click_cf"]:
-                    try:
-                        getattr(sb, method_name)(timeout=5)
-                        log(f"  ✅ {method_name} 执行")
-                        time.sleep(3)
-                        break
-                    except Exception:
-                        continue
+                # 用 uc_gui_click_captcha 处理
+                try:
+                    sb.uc_gui_click_captcha(timeout=5)
+                    log(f"  ✅ uc_gui_click_captcha 执行")
+                    time.sleep(3)
+                    # 检查是否消失
+                    body2 = (sb.get_text("body") or "").lower()
+                    if "security verification" not in body2:
+                        log("  ✅ Turnstile 验证通过！")
+                except Exception as e:
+                    log(f"  ⚠️ uc_gui_click_captcha 失败: {e}")
                 continue
-        except Exception:
-            pass
-
-        # 检查是否有确认对话框
-        try:
-            confirm_btns = sb.find_elements('button:contains("Confirm"), button:contains("confirm"), button:contains("Yes"), button:contains("yes")')
-            for btn in confirm_btns:
-                log(f"  ✅ 点击确认按钮: '{btn.text}'")
-                sb.execute_script("arguments[0].click()", btn)
-                time.sleep(2)
         except Exception:
             pass
 
@@ -388,7 +380,7 @@ def renew_server(sb):
                 renewed = True
                 break
 
-            # 如果页面出现 "renewed" 且不是之前已有的文本
+            # 如果页面出现 "just renewed" 等提示
             body_lower = body.lower()
             if "just renewed" in body_lower or "successfully renewed" in body_lower:
                 log("🎉 检测到续期成功提示")
@@ -400,38 +392,55 @@ def renew_server(sb):
         except Exception as e:
             log(f"  ⚠️ 检查异常: {e}")
 
-    # ===== 如果等待超时，尝试 JS API =====
+    # ===== 如果等待超时，尝试 XHR 同步调用 =====
     if not renewed:
         log("=" * 40)
-        log("🔄 尝试 JS fetch 调续期 API...")
+        log("🔄 尝试 XHR 同步调续期 API...")
         log("=" * 40)
 
-        api_paths = [
-            f'/api/server/{SERVER_ID}/renew',
-            f'/api/client/servers/{SERVER_ID}/renew',
-            f'/api/renew/{SERVER_ID}',
-            f'/server/{SERVER_ID}/renew',
-        ]
+        # 先提取页面中的 API 端点信息
+        try:
+            page_info = sb.execute_script("""
+                var info = {
+                    url: window.location.href,
+                    csrf: (document.querySelector('meta[name=\"csrf-token\"]') || {}).content || '',
+                    forms: Array.from(document.forms).map(function(f) {
+                        return {action: f.action, method: f.method};
+                    }),
+                    buttons: Array.from(document.querySelectorAll('button')).map(function(b) {
+                        return {text: b.textContent.trim(), onclick: b.getAttribute('onclick'), formAction: (b.closest('form') || {}).action};
+                    }),
+                    bodyHead: document.body ? document.body.innerHTML.substring(0, 3000) : '',
+                };
+                return JSON.stringify(info);
+            """)
+            log(f"📄 页面信息: {page_info[:2000]}")
+        except Exception as e:
+            log(f"⚠️ 提取页面信息失败: {e}")
 
-        for api_path in api_paths:
+        # 尝试 XHR 同步调用
+        for api_path in [
+            f'/api/server/{SERVER_ID}/renew',
+            f'/api/server/{SERVER_ID}/renew?',
+            f'/server/{SERVER_ID}/renew',
+            f'/api/renew/{SERVER_ID}',
+        ]:
             try:
                 result = sb.execute_script(f"""
-                    (async () => {{
-                        try {{
-                            const resp = await fetch('{api_path}', {{
-                                method: 'POST',
-                                credentials: 'same-origin',
-                                headers: {{'Content-Type': 'application/json', 'Accept': 'application/json'}},
-                            }});
-                            return JSON.stringify({{status: resp.status, path: '{api_path}'}});
-                        }} catch(e) {{
-                            return JSON.stringify({{error: e.message, path: '{api_path}'}});
-                        }}
-                    }})()
+                    try {{
+                        var xhr = new XMLHttpRequest();
+                        xhr.open('POST', '{api_path}', false);
+                        xhr.setRequestHeader('Content-Type', 'application/json');
+                        xhr.withCredentials = true;
+                        xhr.send();
+                        return JSON.stringify({{status: xhr.status, body: (xhr.responseText || '').substring(0, 200)}});
+                    }} catch(e) {{
+                        return JSON.stringify({{error: e.message}});
+                    }}
                 """)
                 log(f"  {api_path} → {result}")
-                if '"status":200' in result or '"status":201' in result or '"status":204' in result:
-                    log("🎉 JS API 续期成功！")
+                if result and ('"status":200' in result or '"status":201' in result or '"status":204' in result):
+                    log("🎉 XHR 续期成功！")
                     renewed = True
                     time.sleep(3)
                     break
