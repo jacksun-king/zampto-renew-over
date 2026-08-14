@@ -1,0 +1,65 @@
+name: Zampto Auto Renew
+
+on:
+  schedule:
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y google-chrome-stable xvfb x11-utils xdotool scrot fonts-noto-cjk
+          pip install seleniumbase requests
+          seleniumbase install chromedriver
+
+      - name: Setup proxy
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          if [ -n "$NODE_LINK" ]; then
+            bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+          fi
+
+      - name: Run renew
+        env:
+          ZAMPTO_EMAIL: ${{ secrets.ZAMPTO_EMAIL }}
+          ZAMPTO_PASSWORD: ${{ secrets.ZAMPTO_PASSWORD }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          SERVER_ID: ${{ vars.SERVER_ID || '13421' }}
+          ALL_PROXY: http://127.0.0.1:1081
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+            python3 zampto_renew.py
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: "*.png"
+          retention-days: 3
+
+      - name: Cleanup
+        if: always()
+        run: |
+          pkill -f chromedriver 2>/dev/null || true
+          pkill -f chrome 2>/dev/null || true
+          pkill -f Xvfb 2>/dev/null || true
+          pkill -f sing-box 2>/dev/null || true
