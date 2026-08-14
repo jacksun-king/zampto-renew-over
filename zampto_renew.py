@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Zampto 自动续期 - v5.2
-修复:
-  1. API登录: 用 zampto_csrf cookie 作为CSRF token, 多字段名重试, 打印响应体调试
-  2. Turnstile: 移除不支持的 timeout 参数
-  3. 浏览器登录: 提交后等待更久, 处理SPA跳转
+Zampto 自动续期 - v6.0
+新增: 邮箱验证码自动登录 (Gmail IMAP + App Password)
 """
-import os, time, json, re
+import os, time, json, re, imaplib, email
+from email.header import decode_header
 import requests
 from seleniumbase import SB
 
 EMAIL = os.environ.get("ZAMPTO_EMAIL", "")
 PASSWORD = os.environ.get("ZAMPTO_PASSWORD", "")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 SERVER_ID = os.environ.get("SERVER_ID", "13420")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
@@ -67,14 +66,7 @@ def get_url(sb):
         return ""
 
 
-def page_source(sb):
-    try:
-        return sb.get_page_source() or ""
-    except:
-        return ""
-
-
-def wait_page(sb, t=20):
+def wait_page(sb, t=25):
     st = time.time()
     while time.time() - st < t:
         u = get_url(sb)
@@ -88,7 +80,7 @@ def wait_page(sb, t=20):
     return False
 
 
-def nav(sb, u, t=20):
+def nav(sb, u, t=25):
     log(f"🌐 {u}")
     for _ in range(3):
         try:
@@ -142,212 +134,247 @@ def find_btn(sb):
     return None
 
 
-def api_login():
-    """API登录 - 多策略尝试"""
-    log("🔐 API登录...")
-    prox = proxy_dict()
-    sess = requests.Session()
-    sess.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    })
-    if prox:
-        sess.proxies = prox
+def get_verification_code():
+    """从Gmail读取最新的验证码"""
+    log("📧 连接Gmail IMAP...")
+    try:
+        imap = imaplib.IMAP4_SSL("imap.gmail.com")
+        imap.login(EMAIL, GMAIL_APP_PASSWORD)
+        log("✅ Gmail登录成功")
+    except Exception as e:
+        log(f"❌ Gmail登录失败: {e}")
+        return None
 
-    # === 策略1: 获取登录页, 提取CSRF, 带CSRF POST ===
-    log("📄 获取登录页...")
-    r = sess.get(f"{BASE_URL}/auth/login", timeout=15, allow_redirects=True)
-    html = r.text
-    cookies = sess.cookies.get_dict()
-    log(f"  GET HTTP {r.status_code}, cookies({len(cookies)}): {list(cookies.keys())[:5]}")
+    for attempt in range(5):
+        log(f"📧 搜索验证码邮件 (尝试 {attempt+1}/5)...")
+        imap.select("INBOX")
+        # 搜索最近5分钟的邮件
+        status, messages = imap.search(None, f'(SINCE "{time.strftime("%d-%b-%Y")}" (SUBJECT "verify" OR SUBJECT "verification" OR SUBJECT "Zampto" OR SUBJECT "code"))')
+        if status != "OK":
+            log(f"⚠️ 搜索失败: {messages}")
+            time.sleep(8)
+            continue
 
-    # 从cookie获取CSRF
-    csrf_from_cookie = cookies.get("zampto_csrf", "") or cookies.get("_token", "") or cookies.get("csrf_token", "") or ""
-    log(f"  Cookie CSRF: {'✅ '+csrf_from_cookie[:20]+'...' if csrf_from_cookie else '❌'}")
+        msg_ids = messages[0].split()
+        if not msg_ids:
+            log("⚠️ 未找到验证码邮件")
+            time.sleep(8)
+            continue
 
-    # 从HTML提取CSRF
-    csrf_token = None
-    for pattern in [r'name="_token"\s*value="([^"]+)"',
-                    r'name="__csrf_token__"\s*value="([^"]+)"',
-                    r'name="csrf_token"\s*value="([^"]+)"',
-                    r'name="csrf"\s*value="([^"]+)"']:
-        m = re.search(pattern, html)
-        if m:
-            csrf_token = m.group(1)
-            log(f"  HTML CSRF: ✅ {csrf_token[:20]}...")
-            break
-    if not csrf_token:
-        csrf_token = csrf_from_cookie
+        # 取最新的邮件
+        for msg_id in reversed(msg_ids):
+            status, msg_data = imap.fetch(msg_id, "(RFC822)")
+            if status != "OK":
+                continue
+            raw = msg_data[0][1]
+            msg = email.message_from_bytes(raw)
 
-    # 尝试多个CSRF字段名
-    csrf_fields = ["_token", "__csrf_token__", "csrf_token", "csrf", "_token"]
-    if not csrf_token:
-        csrf_fields = []  # 无CSRF
+            # 获取正文
+            body = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/plain":
+                        body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                        break
+            else:
+                body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
 
-    for csrf_field in csrf_fields:
-        login_data = {"email": EMAIL, "password": PASSWORD}
-        if csrf_token:
-            login_data[csrf_field] = csrf_token
-            log(f"📤 POST with {csrf_field}={csrf_token[:16]}...")
-        else:
-            log(f"📤 POST without CSRF...")
+            # 提取6位验证码
+            codes = re.findall(r'\b[0-9]{6}\b', body)
+            if codes:
+                code = codes[0]
+                log(f"✅ 找到验证码: {code}")
+                imap.logout()
+                return code
 
-        r = sess.post(f"{BASE_URL}/auth/login", data=login_data, timeout=15, allow_redirects=True)
-        cookies = sess.cookies.get_dict()
-        has_session = any("session" in k.lower() for k in cookies.keys())
-        logged_in = "/auth/login" not in r.url and "/login" not in r.url
-        log(f"    HTTP {r.status_code} | URL: {r.url} | session: {'✅' if has_session else '❌'} | logged: {'✅' if logged_in else '❌'}")
+            # 没有6位数字，尝试4位或更多格式
+            codes = re.findall(r'\b[0-9]{4,8}\b', body)
+            if codes:
+                code = codes[0]
+                log(f"✅ 找到验证码(变长): {code}")
+                imap.logout()
+                return code
 
-        if has_session or logged_in:
-            log(f"✅ API登录成功 (session={has_session}, url={logged_in})")
-            return sess
+        log("⚠️ 邮件中找到但无验证码数字，等待新邮件...")
+        time.sleep(8)
 
-        # 打印响应体调试
-        body = r.text[:300]
-        log(f"    响应体: {body[:200]}")
-
-    # === 策略2: JSON POST 到API端点 ===
-    for endpoint, body in [
-        ("/api/v1/login", json.dumps({"email": EMAIL, "password": PASSWORD})),
-        ("/api/auth/login", json.dumps({"email": EMAIL, "password": PASSWORD})),
-        ("/api/login", json.dumps({"email": EMAIL, "password": PASSWORD})),
-    ]:
-        log(f"📤 {endpoint} (JSON)...")
-        r = sess.post(
-            f"{BASE_URL}{endpoint}",
-            data=body,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-            timeout=15,
-        )
-        log(f"    HTTP {r.status_code}")
-        if r.status_code == 200:
-            cookies = sess.cookies.get_dict()
-            has_session = any("session" in k.lower() for k in cookies.keys())
-            if has_session:
-                log(f"  ✅ {endpoint} 成功")
-                return sess
-            try:
-                data = r.json()
-                log(f"  响应: {json.dumps(data)[:200]}")
-            except:
-                log(f"  响应: {r.text[:200]}")
-
-    # === 策略3: 带CSRF的JSON ===
-    if csrf_token:
-        for endpoint in ["/api/v1/login", "/api/auth/login"]:
-            log(f"📤 {endpoint} (JSON+CSRF)...")
-            body = {"email": EMAIL, "password": PASSWORD, "_token": csrf_token}
-            r = sess.post(
-                f"{BASE_URL}{endpoint}",
-                data=json.dumps(body),
-                headers={"Content-Type": "application/json"},
-                timeout=15,
-            )
-            log(f"    HTTP {r.status_code}")
-            if r.status_code == 200:
-                cookies = sess.cookies.get_dict()
-                has_session = any("session" in k.lower() for k in cookies.keys())
-                if has_session:
-                    log(f"  ✅ {endpoint}+CSRF 成功")
-                    return sess
-
-    log("❌ 所有API登录均失败")
+    imap.logout()
+    log("❌ 超时未获取验证码")
     return None
 
 
-def browser_login(sb):
-    """浏览器登录(降级)"""
-    log("🌐 浏览器登录...")
+def email_code_login(sb):
+    """邮箱验证码登录流程"""
+    log("📧 邮箱验证码登录流程...")
     if not nav(sb, f"{BASE_URL}/auth/login", 25):
         return False
     time.sleep(3)
 
-    # 保存页面源码调试
+    # 检查页面上是否有邮箱验证码选项
     try:
-        src = page_source(sb)
-        log(f"  页面源码: {len(src)} 字符")
-        # 查找表单结构
-        forms = re.findall(r'<form[^>]*>', src)
-        if forms:
-            for f in forms:
-                log(f"  表单: {f[:200]}")
+        src = sb.get_page_source() or ""
+        has_email_code = "email code" in src.lower() or "email code" in innerText(sb).lower()
+        has_password = 'input[type="password"]' in src or 'name="password"' in src
+        log(f"  页面: 邮箱验证码={'✅' if has_email_code else '❌'}, 密码表单={'✅' if has_password else '❌'}")
     except:
-        pass
+        has_email_code = False
+        has_password = False
 
-    # 等待表单
+    if has_password:
+        # 如果还有密码表单，试试密码登录
+        return try_password_login(sb)
+
+    # 密码表单不存在，用邮箱验证码
+    # Step 1: 点击 "Login with Email Code" 或类似按钮
     try:
-        sb.wait_for_element('input[name="email"], input[type="email"]', timeout=10)
-        log("✅ 找到登录表单")
+        sb.click('button:contains("Email Code"), a:contains("Email Code"), button:contains("邮箱"), button:contains("verification code")', timeout=8)
+        log("✅ 已点击邮箱验证码")
+        time.sleep(3)
+    except Exception as e:
+        log(f"⚠️ 点击邮箱验证码: {e}")
+        # 尝试通用按钮
+        try:
+            sb.execute_script("""
+                var btns=document.querySelectorAll('button, a');
+                for(var b of btns){
+                    var t=(b.innerText||b.textContent||'').trim().toLowerCase();
+                    if(t.includes('email')||t.includes('code')||t.includes('verification')){b.click();break;}
+                }
+            """)
+            log("✅ JS点击邮箱验证码")
+            time.sleep(3)
+        except Exception as e2:
+            log(f"⚠️ JS也失败: {e2}")
+
+    # Step 2: 确认邮箱已填入，如果没有则填入
+    try:
+        email_input = sb.find_element('input[name="email"], input[type="email"]')
+        current_email = sb.execute_script("return arguments[0].value;", email_input)
+        if not current_email or current_email != EMAIL:
+            sb.type('input[name="email"], input[type="email"]', EMAIL, timeout=5)
+            log(f"✅ 填入邮箱: {EMAIL}")
     except:
-        log(f"⚠️ 未找到表单: {innerText(sb)[:200]}")
-        shot(sb, "no_form")
+        log("⚠️ 邮箱输入框查找失败")
+
+    # Step 3: 点击发送验证码
+    try:
+        sb.click('button:contains("Send"), button:contains("Request"), button:contains("获取"), button:contains("发送"), button:contains("Get Code")', timeout=8)
+        log("✅ 已点击发送验证码")
+        time.sleep(3)
+    except Exception as e:
+        log(f"⚠️ 点击发送: {e}")
+        try:
+            sb.execute_script("""
+                var btns=document.querySelectorAll('button, a');
+                for(var b of btns){
+                    var t=(b.innerText||b.textContent||'').trim().toLowerCase();
+                    if(t.includes('send')||t.includes('request')||t.includes('get')||t.includes('code')){b.click();break;}
+                }
+            """)
+            log("✅ JS点击发送")
+            time.sleep(3)
+        except:
+            pass
+
+    # Step 4: 从Gmail获取验证码
+    if not GMAIL_APP_PASSWORD:
+        log("❌ 未配置GMAIL_APP_PASSWORD，无法自动获取验证码")
         return False
 
-    # 填写
-    try:
-        sb.type('input[name="email"], input[type="email"]', EMAIL, timeout=5)
-        sb.type('input[name="password"], input[type="password"]', PASSWORD, timeout=5)
-        log("✅ 已填写")
-    except Exception as e:
-        log(f"⚠️ 填写失败: {e}")
+    code = get_verification_code()
+    if not code:
         return False
-    time.sleep(2)
 
-    # 处理Turnstile - 无timeout参数
+    # Step 5: 填入验证码
     try:
-        sb.uc_gui_click_captcha()
-        time.sleep(4)
-        log("✅ Turnstile 已处理")
+        sb.type('input[name="code"], input[name="otp"], input[name="verification_code"], input[type="text"]', code, timeout=5)
+        log(f"✅ 填入验证码: {code}")
+        time.sleep(2)
     except Exception as e:
-        log(f"⚠️ Turnstile: {e} (继续...)")
+        log(f"⚠️ 填入验证码: {e}")
+        try:
+            # 找到6位数字输入框
+            sb.execute_script(f"""
+                var inputs=document.querySelectorAll('input');
+                for(var i of inputs){{
+                    if(i.type==='text'||i.type==='number'||!i.type){{
+                        if(!i.value)i.value='{code}';
+                    }}
+                }}
+            """)
+            log("✅ JS填入验证码")
+        except:
+            pass
 
-    # 提交
+    # Step 6: 提交
     try:
-        sb.click('button[type="submit"]', timeout=5)
-        log("✅ 已点击提交")
-    except:
+        sb.click('button[type="submit"], button:contains("Verify"), button:contains("确认"), button:contains("Login")', timeout=8)
+        log("✅ 已点击验证/登录")
+    except Exception as e:
+        log(f"⚠️ 点击验证: {e}")
         try:
             sb.execute_script("document.querySelector('form')?.submit()")
-            log("✅ 已JS提交")
-        except Exception as e:
-            log(f"⚠️ 提交失败: {e}")
+        except:
+            pass
 
-    # 等待跳转
     time.sleep(8)
-
     u = get_url(sb)
     tx = innerText(sb).lower()
     log(f"📌 {u} ({len(tx)}c)")
 
-    # 检查是否在dashboard
-    if any(k in tx for k in ["dashboard", "服务器", "server", "expire", "renew", "dashboard"]):
-        log("✅ 登录成功(在dashboard)")
+    if any(k in tx for k in ["dashboard", "服务器", "server", "expire", "renew"]):
+        log("✅ 验证码登录成功")
         return True
-
     if "login" in u.lower() or "auth" in u.lower():
         log("❌ 仍在登录页")
-        shot(sb, "login_fail")
-        # 打印页面上所有按钮文本
-        try:
-            btns = sb.execute_script("""
-                var btns=document.querySelectorAll('button, input[type=submit], a');
-                var result=[];
-                btns.forEach(b=>result.push((b.innerText||b.value||b.textContent||'').trim()));
-                return result.join('\\n');
-            """)
-            log(f"  按钮: {btns[:300]}")
-        except:
-            pass
+        shot(sb, "email_code_fail")
+        return False
+    log("✅ 登录成功")
+    return True
+
+
+def try_password_login(sb):
+    """密码登录(旧方式，备用)"""
+    log("🔐 尝试密码登录...")
+    try:
+        sb.wait_for_element('input[name="email"], input[type="email"]', timeout=5)
+    except:
         return False
 
-    log("✅ 登录成功")
+    try:
+        sb.type('input[name="email"], input[type="email"]', EMAIL, timeout=5)
+        sb.type('input[name="password"], input[type="password"]', PASSWORD, timeout=5)
+        log("✅ 已填写密码")
+        time.sleep(1)
+    except Exception as e:
+        log(f"⚠️ 填写失败: {e}")
+        return False
+
+    # Turnstile
+    try:
+        sb.uc_gui_click_captcha()
+        time.sleep(4)
+    except Exception as e:
+        log(f"⚠️ Turnstile: {e}")
+
+    try:
+        sb.click('button[type="submit"]', timeout=5)
+        log("✅ 已提交")
+    except:
+        pass
+    time.sleep(8)
+
+    u = get_url(sb)
+    if "login" in u.lower() or "auth" in u.lower():
+        log("❌ 密码登录失败")
+        return False
+    log("✅ 密码登录成功")
     return True
 
 
 def main():
     log("=" * 40)
-    log("Zampto 续期 v5.2")
+    log("Zampto 续期 v6.0")
     log("=" * 40)
     log(f"📌 服务器: {SERVER_ID}")
 
@@ -362,15 +389,6 @@ def main():
         if "proxy" in k.lower():
             os.environ.pop(k, None)
 
-    # ===== 登录 =====
-    api_sess = api_login()
-    use_cookies = None
-    if api_sess:
-        use_cookies = api_sess.cookies.get_dict()
-        log(f"✅ 获取到 {len(use_cookies)} 个cookie")
-    else:
-        log("⚠️ 降级到浏览器登录...")
-
     try:
         with SB(uc=True, headless2=True, incognito=False) as sb:
             log("✅ 浏览器就绪")
@@ -382,33 +400,13 @@ def main():
                 return
             time.sleep(2)
 
-            if use_cookies:
-                log("🍪 注入cookie...")
-                for name, value in use_cookies.items():
-                    try:
-                        sb.add_cookie({"name": name, "value": value, "domain": ".zampto.net", "path": "/"})
-                        log(f"  ✅ {name}")
-                    except:
-                        try:
-                            sb.add_cookie({"name": name, "value": value, "domain": "dash.zampto.net", "path": "/"})
-                            log(f"  ✅ {name}(dash)")
-                        except Exception as e:
-                            log(f"  ⚠️ {name}: {e}")
-                sb.refresh()
-                time.sleep(3)
-
-            u = get_url(sb)
-            tx = innerText(sb).lower()
-            log(f"📌 {u}")
-
-            if "login" in u.lower() or "auth" in u.lower():
-                log("⚠️ 未登录，浏览器登录...")
-                if not browser_login(sb):
-                    log("❌ 登录彻底失败")
-                    shot(sb, "final_fail")
-                    send_tg("登录失败，无法续期", "❌")
-                    return
-                time.sleep(3)
+            # 尝试邮箱验证码登录
+            if not email_code_login(sb):
+                log("❌ 登录失败")
+                shot(sb, "final_fail")
+                send_tg("登录失败，无法续期", "❌")
+                return
+            time.sleep(3)
 
             log("✅ 已登录")
             shot(sb, "logged_in")
@@ -421,27 +419,13 @@ def main():
             time.sleep(5)
 
             tx = innerText(sb)
-            try:
-                log(f"📄 标题: {sb.get_page_title()}")
-            except:
-                pass
             log(f"📄 {tx[:400]}")
 
             btn = find_btn(sb)
             if not btn:
                 log("❌ 未找到续期按钮")
-                log(f"内容: {tx[:800]}")
-                # 打印所有按钮文本
-                try:
-                    btns = sb.execute_script("""
-                        var btns=document.querySelectorAll('button, a, div[role=button], input, span');
-                        var result=[];
-                        btns.forEach(b=>result.push((b.innerText||b.textContent||b.value||'').trim()));
-                        return result.join('\\n');
-                    """)
-                    log(f"所有可点击元素: {btns[:500]}")
-                except:
-                    pass
+                shot(sb, "no_btn")
+                send_tg("找不到续期按钮", "❌")
                 return
 
             log("🖱️ 点击续期...")
@@ -452,24 +436,16 @@ def main():
                 log("✅ 点击成功")
             except Exception as e:
                 log(f"⚠️ JS点击: {e}")
-                try:
-                    btn.click()
-                except:
-                    pass
             time.sleep(5)
 
             shot(sb, "clicked")
             tl = innerText(sb).lower()
 
-            if "security verification" in tl or "complete the security" in tl or "verify you are human" in tl:
+            if "security verification" in tl or "verify you are human" in tl:
                 log("🔐 处理弹窗...")
                 try:
                     sb.uc_gui_click_captcha()
                     time.sleep(5)
-                except:
-                    pass
-                try:
-                    sb.click('button:contains("Confirm"), button:contains("Continue"), button:contains("Yes")', timeout=5)
                 except:
                     pass
                 time.sleep(3)
