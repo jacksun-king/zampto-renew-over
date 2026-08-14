@@ -226,8 +226,8 @@ def renew_server(sb):
     server_url = f"{BASE_URL}/server?id={SERVER_ID}"
     log(f"🌐 打开服务器详情页: {server_url}")
     try:
-        sb.open(server_url, timeout=20000)
-        time.sleep(3)
+        sb.uc_open_with_reconnect(server_url, reconnect_time=8)
+        time.sleep(5)
     except Exception:
         pass
 
