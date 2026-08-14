@@ -436,6 +436,7 @@ def renew_server(sb):
     # 提取续期前的到期时间
     expiry_text = ""
     last_renewed_text = ""
+    last_renewed_ts = ""  # 实际时间戳，用于准确比较
     try:
         body = sb.get_text("body") or ""
         for line in body.split("\n"):
@@ -444,8 +445,14 @@ def renew_server(sb):
                 expiry_text = l
             if "last renewed" in l.lower() or "上次续期" in l:
                 last_renewed_text = l
+                # 提取实际时间戳: "Aug 14, 2026, 10:10 AM UTC"
+                ts_match = re.search(r'(\w{3}\s+\d{1,2},\s+\d{4},\s+\d{1,2}:\d{2}\s+(?:AM|PM)\s+\w+)', l)
+                if ts_match:
+                    last_renewed_ts = ts_match.group(1)
         log(f"📋 续期前 - 到期: {expiry_text}")
         log(f"📋 续期前 - 上次续期: {last_renewed_text}")
+        if last_renewed_ts:
+            log(f"📋 续期前 - 时间戳: {last_renewed_ts}")
     except Exception:
         pass
 
@@ -521,20 +528,25 @@ def renew_server(sb):
             body = sb.get_text("body") or ""
             current_url = sb.get_current_url()
 
-            # 找 Last Renewed 时间
+            # 找 Last Renewed 时间（提取实际时间戳）
+            new_last_renewed_ts = ""
             for line in body.split("\n"):
                 l = line.strip()
                 if "last renewed" in l.lower() or "上次续期" in l:
-                    new_last_renewed = l
+                    new_last_renewed_text = l
+                    ts_match = re.search(r'(\w{3}\s+\d{1,2},\s+\d{4},\s+\d{1,2}:\d{2}\s+(?:AM|PM)\s+\w+)', l)
+                    if ts_match:
+                        new_last_renewed_ts = ts_match.group(1)
                 if "next renewal" in l.lower() or "expir" in l.lower() or "剩" in l:
                     new_expiry = l
 
-            # 如果 Last Renewed 时间变了，说明续期成功
-            if new_last_renewed and new_last_renewed != last_renewed_text:
-                log(f"📋 续期后 - 上次续期: {new_last_renewed}")
+            # 比较实际时间戳，而非相对文本
+            renewed = (new_last_renewed_ts and new_last_renewed_ts != last_renewed_ts)
+            if renewed:
+                log(f"📋 续期后 - 上次续期: {new_last_renewed_text}")
                 log(f"📋 续期后 - 到期: {new_expiry}")
+                log(f"📋 续期后 - 时间戳: {new_last_renewed_ts} (旧: {last_renewed_ts})")
                 log("🎉 续期时间已更新！续期成功！")
-                renewed = True
                 break
 
             # 如果页面出现 "just renewed" 等提示
@@ -657,7 +669,7 @@ def main():
         send_tg("配置缺失，无法续期", "❌")
         return
 
-    with SB(uc=True, headless2=True, incognito=False) as sb:
+    with SB(uc=True, headed=True, incognito=False) as sb:
         log("🚀 浏览器启动")
         log(f"📌 代理: {PROXY or '直连'}")
 
