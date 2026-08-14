@@ -29,13 +29,6 @@ jobs:
           pip install seleniumbase requests
           seleniumbase install chromedriver
 
-      - name: Setup proxy
-        continue-on-error: true
-        env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}
-        run: |
-          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
-
       - name: Run renew script
         env:
           ZAMPTO_EMAIL: ${{ secrets.ZAMPTO_EMAIL }}
@@ -50,11 +43,9 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          pkill -f sing-box 2>/dev/null || true
           pkill -f chromedriver 2>/dev/null || true
           pkill -f chrome 2>/dev/null || true
           pkill -f Xvfb 2>/dev/null || true
-          rm -f sing-box sing-box-config.json sing-box.log
 
       - name: Clean old workflow runs
         if: always()

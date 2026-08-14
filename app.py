@@ -470,24 +470,12 @@ def main():
         print("❌ 未配置 ZAMPTO_EMAIL 或 ZAMPTO_PASSWORD")
         return
 
-    IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
-    proxy_str = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1081"
-
-    sb_kwargs = {"uc": True, "headless": False}
-    if IS_PROXY:
-        print(f"🔗 挂载代理: {proxy_str}")
-        sb_kwargs["proxy"] = proxy_str
-    else:
-        print("🌐 未使用代理，直连访问")
+    # zampto.net 的 Cloudflare 配置会封锁代理 IP，必须直连
+    # 即使有 NODE_LINK 也不挂代理，避免 Cloudflare 挑战页
+    print("🌐 直连访问（zampto.net 封锁代理 IP，必须直连）")
 
     print("🚀 启动浏览器...")
-    with SB(**sb_kwargs) as sb:
-        try:
-            sb.open("https://api.ip.sb/ip")
-            print(f"📍 当前出口IP: {sb.get_text('body')}")
-        except Exception:
-            pass
-
+    with SB(uc=True, headless=False) as sb:
         if login(sb):
             renew_server(sb)
         else:
