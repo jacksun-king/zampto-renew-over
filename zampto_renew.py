@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Zampto 自动续期 - v5.1
-修复: API 登录增强(带CSRF/表单重放) + 浏览器登录降级
+Zampto 自动续期 - v5.2
+修复:
+  1. API登录: 用 zampto_csrf cookie 作为CSRF token, 多字段名重试, 打印响应体调试
+  2. Turnstile: 移除不支持的 timeout 参数
+  3. 浏览器登录: 提交后等待更久, 处理SPA跳转
 """
 import os, time, json, re
 import requests
@@ -64,6 +67,13 @@ def get_url(sb):
         return ""
 
 
+def page_source(sb):
+    try:
+        return sb.get_page_source() or ""
+    except:
+        return ""
+
+
 def wait_page(sb, t=20):
     st = time.time()
     while time.time() - st < t:
@@ -117,9 +127,9 @@ def find_btn(sb):
         pass
     try:
         btn = sb.execute_script("""
-            var els=document.querySelectorAll('button, a, div[role=button], span');
+            var els=document.querySelectorAll('button, a, div[role=button], span, input[type=submit]');
             for(var e of els){
-                var t=(e.innerText||e.textContent||'').trim().toLowerCase();
+                var t=(e.innerText||e.textContent||e.value||'').trim().toLowerCase();
                 if(t.includes('renew')||t.includes('extend')||t.includes('续期'))return e;
             }
             return null;
@@ -132,91 +142,138 @@ def find_btn(sb):
     return None
 
 
-def api_login_v2():
-    """增强版 API 登录 - 带 CSRF + 表单重放"""
-    log("🔐 API 登录(增强)...")
+def api_login():
+    """API登录 - 多策略尝试"""
+    log("🔐 API登录...")
     prox = proxy_dict()
     sess = requests.Session()
     sess.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
     })
     if prox:
         sess.proxies = prox
 
-    # Step 1: 访问登录页获取 CSRF token
+    # === 策略1: 获取登录页, 提取CSRF, 带CSRF POST ===
     log("📄 获取登录页...")
     r = sess.get(f"{BASE_URL}/auth/login", timeout=15, allow_redirects=True)
-    log(f"  GET 登录页 HTTP {r.status_code}, cookies: {list(sess.cookies.keys())}")
-
-    # 尝试从页面提取 CSRF token
-    csrf_token = None
     html = r.text
-    csrf_match = re.search(r'name="_token"\s*value="([^"]+)"', html)
-    if csrf_match:
-        csrf_token = csrf_match.group(1)
-        log(f"  ✅ CSRF: {csrf_token[:16]}...")
-    csrf_match2 = re.search(r'name="__csrf_token__"\s*value="([^"]+)"', html)
-    if csrf_match2:
-        csrf_token = csrf_match2.group(1)
-        log(f"  ✅ CSRF2: {csrf_token[:16]}...")
-
-    # Step 2: POST 登录(带CSRF)
-    login_data = {"email": EMAIL, "password": PASSWORD}
-    if csrf_token:
-        login_data["_token"] = csrf_token
-
-    log("📤 POST 登录...")
-    r = sess.post(
-        f"{BASE_URL}/auth/login",
-        data=login_data,
-        timeout=15,
-        allow_redirects=True,
-    )
-    log(f"  POST HTTP {r.status_code}, URL: {r.url}")
-
     cookies = sess.cookies.get_dict()
-    log(f"  Cookies({len(cookies)}): {list(cookies.keys())[:10]}")
+    log(f"  GET HTTP {r.status_code}, cookies({len(cookies)}): {list(cookies.keys())[:5]}")
 
-    # 检查是否登录成功
-    has_session = any("session" in k.lower() for k in cookies.keys())
-    logged_in = "/auth/login" not in r.url and "/login" not in r.url
+    # 从cookie获取CSRF
+    csrf_from_cookie = cookies.get("zampto_csrf", "") or cookies.get("_token", "") or cookies.get("csrf_token", "") or ""
+    log(f"  Cookie CSRF: {'✅ '+csrf_from_cookie[:20]+'...' if csrf_from_cookie else '❌'}")
 
-    if has_session or logged_in:
-        log(f"✅ API 登录成功 (session={'✅' if has_session else '❌'} url={'✅' if logged_in else '❌'})")
-        return sess
-    else:
-        log("⚠️ API 登录被拒")
+    # 从HTML提取CSRF
+    csrf_token = None
+    for pattern in [r'name="_token"\s*value="([^"]+)"',
+                    r'name="__csrf_token__"\s*value="([^"]+)"',
+                    r'name="csrf_token"\s*value="([^"]+)"',
+                    r'name="csrf"\s*value="([^"]+)"']:
+        m = re.search(pattern, html)
+        if m:
+            csrf_token = m.group(1)
+            log(f"  HTML CSRF: ✅ {csrf_token[:20]}...")
+            break
+    if not csrf_token:
+        csrf_token = csrf_from_cookie
 
-    # Step 3: 尝试 JSON API 登录
-    for endpoint, body_type in [
-        ("/api/v1/login", "json"),
-        ("/api/auth/login", "data"),
-        ("/api/login", "json"),
-    ]:
-        log(f"  📤 {endpoint}...")
-        r2 = sess.post(
-            f"{BASE_URL}{endpoint}",
-            **({"json": login_data} if body_type == "json" else {"data": login_data}),
-            timeout=15,
-        )
-        log(f"    HTTP {r2.status_code}")
+    # 尝试多个CSRF字段名
+    csrf_fields = ["_token", "__csrf_token__", "csrf_token", "csrf", "_token"]
+    if not csrf_token:
+        csrf_fields = []  # 无CSRF
+
+    for csrf_field in csrf_fields:
+        login_data = {"email": EMAIL, "password": PASSWORD}
+        if csrf_token:
+            login_data[csrf_field] = csrf_token
+            log(f"📤 POST with {csrf_field}={csrf_token[:16]}...")
+        else:
+            log(f"📤 POST without CSRF...")
+
+        r = sess.post(f"{BASE_URL}/auth/login", data=login_data, timeout=15, allow_redirects=True)
         cookies = sess.cookies.get_dict()
         has_session = any("session" in k.lower() for k in cookies.keys())
-        if has_session:
-            log(f"  ✅ {endpoint} 成功")
+        logged_in = "/auth/login" not in r.url and "/login" not in r.url
+        log(f"    HTTP {r.status_code} | URL: {r.url} | session: {'✅' if has_session else '❌'} | logged: {'✅' if logged_in else '❌'}")
+
+        if has_session or logged_in:
+            log(f"✅ API登录成功 (session={has_session}, url={logged_in})")
             return sess
 
-    log("❌ 所有 API 登录均失败")
+        # 打印响应体调试
+        body = r.text[:300]
+        log(f"    响应体: {body[:200]}")
+
+    # === 策略2: JSON POST 到API端点 ===
+    for endpoint, body in [
+        ("/api/v1/login", json.dumps({"email": EMAIL, "password": PASSWORD})),
+        ("/api/auth/login", json.dumps({"email": EMAIL, "password": PASSWORD})),
+        ("/api/login", json.dumps({"email": EMAIL, "password": PASSWORD})),
+    ]:
+        log(f"📤 {endpoint} (JSON)...")
+        r = sess.post(
+            f"{BASE_URL}{endpoint}",
+            data=body,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            timeout=15,
+        )
+        log(f"    HTTP {r.status_code}")
+        if r.status_code == 200:
+            cookies = sess.cookies.get_dict()
+            has_session = any("session" in k.lower() for k in cookies.keys())
+            if has_session:
+                log(f"  ✅ {endpoint} 成功")
+                return sess
+            try:
+                data = r.json()
+                log(f"  响应: {json.dumps(data)[:200]}")
+            except:
+                log(f"  响应: {r.text[:200]}")
+
+    # === 策略3: 带CSRF的JSON ===
+    if csrf_token:
+        for endpoint in ["/api/v1/login", "/api/auth/login"]:
+            log(f"📤 {endpoint} (JSON+CSRF)...")
+            body = {"email": EMAIL, "password": PASSWORD, "_token": csrf_token}
+            r = sess.post(
+                f"{BASE_URL}{endpoint}",
+                data=json.dumps(body),
+                headers={"Content-Type": "application/json"},
+                timeout=15,
+            )
+            log(f"    HTTP {r.status_code}")
+            if r.status_code == 200:
+                cookies = sess.cookies.get_dict()
+                has_session = any("session" in k.lower() for k in cookies.keys())
+                if has_session:
+                    log(f"  ✅ {endpoint}+CSRF 成功")
+                    return sess
+
+    log("❌ 所有API登录均失败")
     return None
 
 
 def browser_login(sb):
-    """浏览器直接登录(降级方案)"""
+    """浏览器登录(降级)"""
     log("🌐 浏览器登录...")
     if not nav(sb, f"{BASE_URL}/auth/login", 25):
         return False
     time.sleep(3)
+
+    # 保存页面源码调试
+    try:
+        src = page_source(sb)
+        log(f"  页面源码: {len(src)} 字符")
+        # 查找表单结构
+        forms = re.findall(r'<form[^>]*>', src)
+        if forms:
+            for f in forms:
+                log(f"  表单: {f[:200]}")
+    except:
+        pass
 
     # 等待表单
     try:
@@ -227,7 +284,7 @@ def browser_login(sb):
         shot(sb, "no_form")
         return False
 
-    # 填写表单
+    # 填写
     try:
         sb.type('input[name="email"], input[type="email"]', EMAIL, timeout=5)
         sb.type('input[name="password"], input[type="password"]', PASSWORD, timeout=5)
@@ -237,9 +294,9 @@ def browser_login(sb):
         return False
     time.sleep(2)
 
-    # 处理 Turnstile
+    # 处理Turnstile - 无timeout参数
     try:
-        sb.uc_gui_click_captcha(timeout=8)
+        sb.uc_gui_click_captcha()
         time.sleep(4)
         log("✅ Turnstile 已处理")
     except Exception as e:
@@ -248,28 +305,49 @@ def browser_login(sb):
     # 提交
     try:
         sb.click('button[type="submit"]', timeout=5)
+        log("✅ 已点击提交")
     except:
         try:
             sb.execute_script("document.querySelector('form')?.submit()")
-        except:
-            pass
-    time.sleep(5)
+            log("✅ 已JS提交")
+        except Exception as e:
+            log(f"⚠️ 提交失败: {e}")
+
+    # 等待跳转
+    time.sleep(8)
 
     u = get_url(sb)
     tx = innerText(sb).lower()
-    log(f"📌 {u}")
+    log(f"📌 {u} ({len(tx)}c)")
+
+    # 检查是否在dashboard
+    if any(k in tx for k in ["dashboard", "服务器", "server", "expire", "renew", "dashboard"]):
+        log("✅ 登录成功(在dashboard)")
+        return True
+
     if "login" in u.lower() or "auth" in u.lower():
-        log("❌ 浏览器登录失败")
+        log("❌ 仍在登录页")
         shot(sb, "login_fail")
+        # 打印页面上所有按钮文本
+        try:
+            btns = sb.execute_script("""
+                var btns=document.querySelectorAll('button, input[type=submit], a');
+                var result=[];
+                btns.forEach(b=>result.push((b.innerText||b.value||b.textContent||'').trim()));
+                return result.join('\\n');
+            """)
+            log(f"  按钮: {btns[:300]}")
+        except:
+            pass
         return False
 
-    log("✅ 浏览器登录成功")
+    log("✅ 登录成功")
     return True
 
 
 def main():
     log("=" * 40)
-    log("Zampto 续期 v5.1")
+    log("Zampto 续期 v5.2")
     log("=" * 40)
     log(f"📌 服务器: {SERVER_ID}")
 
@@ -280,43 +358,37 @@ def main():
         except:
             log("⚠️ 代理不可用")
 
-    # 清除 Chrome 的代理环境变量
     for k in list(os.environ.keys()):
         if "proxy" in k.lower():
             os.environ.pop(k, None)
 
-    # ===== 登录阶段 =====
-    api_sess = api_login_v2()
-
+    # ===== 登录 =====
+    api_sess = api_login()
+    use_cookies = None
     if api_sess:
-        api_cookies = api_sess.cookies.get_dict()
-        log(f"✅ 获取到 {len(api_cookies)} 个 cookie")
-        use_cookies = api_cookies
+        use_cookies = api_sess.cookies.get_dict()
+        log(f"✅ 获取到 {len(use_cookies)} 个cookie")
     else:
         log("⚠️ 降级到浏览器登录...")
-        use_cookies = None
 
-    # ===== 启动浏览器 =====
     try:
         with SB(uc=True, headless2=True, incognito=False) as sb:
             log("✅ 浏览器就绪")
             time.sleep(2)
 
-            # 先访问首页
             if not nav(sb, BASE_URL, 25):
                 log("❌ 首页打不开")
                 send_tg("首页打不开", "❌")
                 return
             time.sleep(2)
 
-            # 注入 cookie（如果有）
             if use_cookies:
-                log("🍪 注入 cookie...")
+                log("🍪 注入cookie...")
                 for name, value in use_cookies.items():
                     try:
                         sb.add_cookie({"name": name, "value": value, "domain": ".zampto.net", "path": "/"})
                         log(f"  ✅ {name}")
-                    except Exception:
+                    except:
                         try:
                             sb.add_cookie({"name": name, "value": value, "domain": "dash.zampto.net", "path": "/"})
                             log(f"  ✅ {name}(dash)")
@@ -325,13 +397,12 @@ def main():
                 sb.refresh()
                 time.sleep(3)
 
-            # 检查是否已登录
             u = get_url(sb)
             tx = innerText(sb).lower()
             log(f"📌 {u}")
 
             if "login" in u.lower() or "auth" in u.lower():
-                log("⚠️ 未登录，尝试浏览器登录...")
+                log("⚠️ 未登录，浏览器登录...")
                 if not browser_login(sb):
                     log("❌ 登录彻底失败")
                     shot(sb, "final_fail")
@@ -340,8 +411,9 @@ def main():
                 time.sleep(3)
 
             log("✅ 已登录")
+            shot(sb, "logged_in")
 
-            # ===== 续期阶段 =====
+            # ===== 续期 =====
             u = f"{BASE_URL}/server?id={SERVER_ID}"
             if not nav(sb, u, 25):
                 return
@@ -358,11 +430,16 @@ def main():
             btn = find_btn(sb)
             if not btn:
                 log("❌ 未找到续期按钮")
-                log(f"内容: {tx[:600]}")
+                log(f"内容: {tx[:800]}")
+                # 打印所有按钮文本
                 try:
-                    src = sb.get_page_source()
-                    with open("page.html", "w") as f:
-                        f.write(src)
+                    btns = sb.execute_script("""
+                        var btns=document.querySelectorAll('button, a, div[role=button], input, span');
+                        var result=[];
+                        btns.forEach(b=>result.push((b.innerText||b.textContent||b.value||'').trim()));
+                        return result.join('\\n');
+                    """)
+                    log(f"所有可点击元素: {btns[:500]}")
                 except:
                     pass
                 return
@@ -384,11 +461,10 @@ def main():
             shot(sb, "clicked")
             tl = innerText(sb).lower()
 
-            # 处理安全验证弹窗
             if "security verification" in tl or "complete the security" in tl or "verify you are human" in tl:
                 log("🔐 处理弹窗...")
                 try:
-                    sb.uc_gui_click_captcha(timeout=8)
+                    sb.uc_gui_click_captcha()
                     time.sleep(5)
                 except:
                     pass
@@ -398,7 +474,6 @@ def main():
                     pass
                 time.sleep(3)
 
-            # 检查续期结果
             tx = innerText(sb)
             for l in tx.split("\n"):
                 l = l.strip()
@@ -409,7 +484,9 @@ def main():
             send_tg("续期完成", "✅")
 
     except Exception as e:
+        import traceback
         log(f"💥 {e}")
+        log(traceback.format_exc()[:500])
         send_tg(f"异常: {e}", "💥")
 
 
