@@ -255,9 +255,14 @@ def renew_server(sb):
         cur_url = sb.get_current_url()
         log(f"📌 点击后 URL: {cur_url}")
 
-    # 查找续期按钮
+        # 如果还是列表页，退出
+        if "/server?id=" not in cur_url and "/server/" not in cur_url:
+            log("❌ 无法进入服务器详情页")
+            return False
+
+    # 查找续期按钮并记录续期前状态
     log("🔍 查找续期按钮...")
-    found = False
+    renew_btn = None
     btn_selectors = [
         'button:contains("Renew Server")',
         'button:contains("Renew")',
@@ -267,80 +272,178 @@ def renew_server(sb):
         'button:contains("extend")',
         'button.w-full.bg-gradient-to-r',
         'button[data-slot="button"]:has(svg.lucide-repeat)',
-        'button[aria-label*="renew" i]',
-        'button[title*="renew" i]',
     ]
 
     for sel in btn_selectors:
         try:
-            if sb.find_element(sel, timeout=3):
-                log(f"  找到按钮: {sel}")
-                found = True
-                break
+            elems = sb.find_elements(sel)
+            if elems:
+                for elem in elems:
+                    txt = (elem.text or "").strip()
+                    if "renew" in txt.lower() or "续期" in txt:
+                        log(f"  找到按钮: '{txt}'")
+                        renew_btn = elem
+                        break
+                if renew_btn:
+                    break
         except Exception:
             continue
 
-    if not found:
-        # 遍历所有按钮
+    if not renew_btn:
+        # 遍历所有按钮文本
         try:
             for btn in sb.find_elements("button"):
                 txt = (btn.text or "").strip()
                 if txt and ("renew" in txt.lower() or "续期" in txt or "extend" in txt.lower()):
                     log(f"  找到按钮文本: {txt}")
-                    found = True
+                    renew_btn = btn
                     break
         except Exception:
             pass
 
-    if not found:
+    if not renew_btn:
         log("❌ 未找到续期按钮")
         shot(sb, "no_renew_btn")
-        # 保存页面源码分析
-        try:
-            with open("page_source.html", "w") as f:
-                f.write(sb.get_page_source())
-        except Exception:
-            pass
-        # 尝试打印页面可见文本
-        try:
-            body_text = sb.get_text("body") or ""
-            log(f"📄 页面文本片段: {body_text[:300]}")
-        except Exception:
-            pass
         return False
 
-    # 点击续期
-    log("🖱️ 点击续期按钮...")
-    try:
-        sb.execute_script(
-            "arguments[0].scrollIntoView({behavior:'smooth',block:'center'});",
-            sb.find_element('button:contains("Renew")')
-        )
-        time.sleep(1)
-        sb.click('button:contains("Renew")')
-    except Exception:
-        try:
-            sb.click('button:contains("Renew")')
-        except Exception as e:
-            log(f"❌ 点击失败: {e}")
-            return False
-
-    time.sleep(5)
-    shot(sb, "renew_clicked")
-
-    # 检查结果
+    # 记录续期前的到期时间
+    expiry_before = ""
     try:
         body = sb.get_text("body") or ""
-        if "renewed" in body.lower() or "expir" in body.lower() or "success" in body.lower():
-            log("✅ 续期完成！")
-            send_tg("续期成功 ✅", "✅")
-            return True
+        for line in body.split("\n"):
+            l = line.strip()
+            if "expir" in l.lower() or "last renewed" in l.lower():
+                expiry_before = l
+                log(f"📋 续期前: {l}")
     except Exception:
         pass
 
-    log("✅ 续期按钮已点击（等待下次检查确认）")
-    send_tg("续期按钮已点击，等待确认", "ℹ️")
-    return True
+    # === 方案 A: 先尝试点击按钮 ===
+    log("🖱️ 方案A: 点击续期按钮...")
+    try:
+        sb.execute_script("arguments[0].scrollIntoView({behavior:'smooth',block:'center'});", renew_btn)
+        time.sleep(1)
+        sb.execute_script("arguments[0].click()", renew_btn)
+        log("✅ JS click 完成")
+    except Exception as e:
+        log(f"⚠️ JS click 失败: {e}")
+        try:
+            renew_btn.click()
+            log("✅ 直接 click 完成")
+        except Exception as e2:
+            log(f"❌ 点击失败: {e2}")
+
+    time.sleep(10)
+    shot(sb, "renew_clicked")
+
+    # 检查 Cloudflare 挑战
+    try:
+        body = (sb.get_text("body") or "").lower()
+        if "just a moment" in body or "checking your browser" in body:
+            log("⚠️ Cloudflare 挑战，等待...")
+            time.sleep(15)
+            shot(sb, "cf_after")
+    except Exception:
+        pass
+
+    # 检查是否有 Turnstile
+    try:
+        sb.uc_gui_click_captcha(timeout=5)
+        log("🖱️ 已尝试点击 Turnstile")
+        time.sleep(3)
+    except Exception:
+        pass
+
+    # 检查续期后页面
+    try:
+        body = sb.get_text("body") or ""
+        log(f"📄 续期后页面文本:")
+        for line in body.split("\n"):
+            l = line.strip()
+            if "renew" in l.lower() or "expir" in l.lower() or "last" in l.lower() or "success" in l.lower() or "error" in l.lower() or "fail" in l.lower():
+                log(f"  📋 {l}")
+    except Exception:
+        pass
+
+    # 检查续期结果
+    renewed = False
+    try:
+        body = sb.get_text("body") or ""
+        if "renewed" in body.lower() and "expiry" in body.lower():
+            # 有空检查续期时间是否变化
+            renewed = True
+        elif "just renewed" in body.lower():
+            renewed = True
+        elif "renewal successful" in body.lower() or "successfully renewed" in body.lower():
+            renewed = True
+    except Exception:
+        pass
+
+    # === 方案 B: 通过浏览器 JS 直接调 API 续期 ===
+    if not renewed:
+        log("=" * 40)
+        log("🔄 方案B: 通过浏览器 JS 直接调续期 API...")
+        log("=" * 40)
+
+        try:
+            # 获取 CSRF token
+            csrf_token = sb.execute_script("""
+                return document.querySelector('meta[name="csrf-token"]')?.content
+                    || document.querySelector('meta[name="csrf-param"]')?.content
+                    || '';
+            """) or ""
+            if csrf_token:
+                log(f"📌 CSRF token: {csrf_token[:20]}...")
+
+            # 获取 XSRF-TOKEN cookie
+            xsrf = sb.execute_script("""
+                return document.cookie.split('; ')
+                    .find(c => c.startsWith('XSRF-TOKEN='))
+                    ?.split('=')[1] || '';
+            """) or ""
+
+            # 尝试通过 fetch 调续期 API
+            result = sb.execute_script(f"""
+                (async () => {{
+                    try {{
+                        const resp = await fetch('/api/server/{SERVER_ID}/renew', {{
+                            method: 'POST',
+                            headers: {{
+                                'Content-Type': 'application/json',
+                                'Accept': 'application/json',
+                                'X-CSRF-TOKEN': '{csrf_token}',
+                                'X-XSRF-TOKEN': '{xsrf}',
+                            }},
+                            credentials: 'same-origin',
+                        }});
+                        const data = await resp.text();
+                        return JSON.stringify({{status: resp.status, body: data.substring(0, 500)}});
+                    }} catch(e) {{
+                        return JSON.stringify({{error: e.message}});
+                    }}
+                }})()
+            """)
+            log(f"📌 API 响应: {result}")
+            if '"status":200' in result or '"status":201' in result or '"status":204' in result:
+                log("🎉 续期 API 调用成功！")
+                renewed = True
+            elif '"status":' in result:
+                log(f"⚠️ API 返回非 200 状态码")
+        except Exception as e:
+            log(f"⚠️ 方案B 失败: {e}")
+
+    if renewed:
+        log("=" * 40)
+        log("🎉 续期成功！")
+        log("=" * 40)
+        send_tg("续期成功 ✅", "✅")
+        return True
+    else:
+        log("=" * 40)
+        log("❌ 续期失败")
+        log("=" * 40)
+        send_tg("续期失败，请检查面板", "❌")
+        return False
 
 # ===== 主入口 =====
 def main():
