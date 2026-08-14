@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Zampto 自动续期 - v6.1
-修复: Gmail IMAP验证码登录 + CSS选择器兼容
+Zampto 自动续期 - v7.0 (基于原版 akimify/Zampto-Renew)
+登录入口: auth.zampto.net/sign-in (两步: 邮箱 → 密码)
 """
-import os, time, json, re, imaplib, email
-import requests
+import os, time, json, requests
 from seleniumbase import SB
 
-EMAIL = os.environ.get("ZAMPTO_EMAIL", "")
-PASSWORD = os.environ.get("ZAMPTO_PASSWORD", "")
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
+# ===== 配置 =====
+LOGIN_URL = "https://auth.zampto.net/sign-in?app_id=bmhk6c8qdqxphlyscztgl"
 SERVER_ID = os.environ.get("SERVER_ID", "13420")
+DASHBOARD_URL = f"https://dash.zampto.net/server?id={SERVER_ID}"
+PROXY = os.environ.get("ALL_PROXY") or ""
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
-PROXY = os.environ.get("ALL_PROXY") or ""
-BASE_URL = "https://dash.zampto.net"
 _shot = 0
+
+# 从 ZAMPTO_ACCOUNT (user:pwd) 或单独的 EMAIL/PASSWORD 读取
+ZAMPTO_ACCOUNT = os.environ.get("ZAMPTO_ACCOUNT", "")
+EMAIL = os.environ.get("ZAMPTO_EMAIL", "")
+PASSWORD = os.environ.get("ZAMPTO_PASSWORD", "")
+
+if ZAMPTO_ACCOUNT:
+    EMAIL, PASSWORD = ZAMPTO_ACCOUNT.split(":", 1)
+elif not (EMAIL and PASSWORD):
+    raise RuntimeError("未配置 ZAMPTO_EMAIL/PASSWORD 或 ZAMPTO_ACCOUNT")
 
 
 def log(m):
@@ -47,183 +55,215 @@ def send_tg(m, i="ℹ️"):
         pass
 
 
-def proxy_dict():
-    return {"http": PROXY, "https": PROXY} if PROXY else None
+# ===== 原版登录流程 =====
+def login(sb):
+    log("🔐 访问登录页...")
+    sb.maximize_window()
+    sb.uc_open_with_reconnect(LOGIN_URL, 4)
+    time.sleep(3)
 
-
-def innerText(sb):
-    try:
-        return sb.execute_script("return document.body.innerText||''") or ""
-    except:
-        return ""
-
-
-def get_url(sb):
-    try:
-        return sb.get_current_url()
-    except:
-        return ""
-
-
-def wait_page(sb, t=25):
-    st = time.time()
-    while time.time() - st < t:
-        u = get_url(sb)
-        txt = innerText(sb)
-        if len(txt) > 150:
-            return True
-        if u and "chrome://" in u:
+    # 等待登录框出现 (最多60s)
+    log("⏳ 等待登录框...")
+    login_ready = False
+    for i in range(30):
+        if sb.is_element_present('input[name="identifier"]'):
+            log("✅ 登录框已就绪")
+            login_ready = True
+            break
+        if sb.is_element_present('iframe') or sb.is_text_visible("Verify you are human") or sb.is_text_visible("security verification"):
+            log(f"🔐 发现CF拦截 (第{i+1}次), 处理...")
+            try:
+                sb.uc_gui_click_captcha()
+            except:
+                pass
+            try:
+                cf_sel = 'iframe[title*="Cloudflare"], iframe[src*="challenge"], iframe[src*="turnstile"]'
+                if sb.is_element_present(cf_sel):
+                    sb.uc_click(cf_sel)
+                else:
+                    sb.uc_click('iframe')
+            except:
+                pass
+            time.sleep(4)
+        else:
             time.sleep(2)
-            continue
-        time.sleep(1)
-    return False
 
+    if not login_ready:
+        shot(sb, "shield_fail")
+        return False
 
-def nav(sb, u, t=25):
-    log(f"🌐 {u}")
-    for _ in range(3):
-        try:
-            sb.open(u)
-        except Exception as e:
-            log(f"⚠️{e}")
-            time.sleep(3)
-            continue
-        if wait_page(sb, t):
-            return True
-    log(f"⚠️{get_url(sb)}")
-    shot(sb, "nav")
+    # 步骤1: 填邮箱
+    log("📧 填邮箱...")
+    sb.type('input[name="identifier"], input[type="email"], input[type="text"]', EMAIL)
+    time.sleep(1)
+
+    # 步骤2: 点Sign in
+    log("🖱️ 点Sign in...")
+    sb.click('button[type="submit"], button:contains("Sign in")')
     time.sleep(5)
+
+    # 步骤3: 填密码
+    log("🔑 填密码...")
+    try:
+        sb.wait_for_element_visible('input[type="password"]', timeout=15)
+        sb.type('input[type="password"]', PASSWORD)
+        time.sleep(1)
+    except Exception as e:
+        log(f"⚠️ 密码框: {e}")
+        return False
+
+    # 步骤4: 点Continue
+    log("🖱️ 点Continue...")
+    sb.click('button[type="submit"], button:contains("Continue")')
+    time.sleep(12)
+
+    # 步骤5: Turnstile
+    log("🔐 Turnstile...")
+    try:
+        sb.uc_gui_click_captcha()
+    except Exception as e:
+        log(f"⚠️ gui_click: {e}")
+    time.sleep(2)
+    try:
+        cf_sel = 'iframe[title*="Cloudflare"], iframe[src*="challenge"], iframe[src*="turnstile"]'
+        if sb.is_element_present(cf_sel):
+            sb.uc_click(cf_sel)
+        else:
+            sb.uc_click('iframe')
+    except Exception as e:
+        log(f"⚠️ uc_click: {e}")
+    time.sleep(25)
+
+    u = sb.get_current_url()
+    if "dash.zampto.net" in u or "auth.zampto.net" not in u:
+        log("✅ 登录成功!")
+        return True
+    log("❌ 登录失败")
+    shot(sb, "login_fail")
     return False
 
 
-def find_btn(sb):
-    for sel in ['button', 'a', 'div[role=button]', 'span', 'input[type=submit]']:
-        try:
-            for e in sb.find_elements(sel):
-                t = (e.text or "").strip()
-                if t and ("renew" in t.lower() or "extend" in t.lower() or "续期" in t):
-                    log(f"✅ CSS: '{t}'")
-                    return e
-        except:
-            continue
+def find_renew_btn(sb):
+    """查找续期按钮"""
+    try:
+        # 原版选择器
+        sel = 'button:contains("Renew Server"), a:contains("Renew Server")'
+        if sb.is_element_visible(sel):
+            log("✅ CSS 找到 Renew Server")
+            return sb.find_element(sel)
+    except:
+        pass
+
+    # 回退: 遍历所有元素
     try:
         btn = sb.execute_script("""
-            var els=document.querySelectorAll('button, a, div[role=button], span, input[type=submit]');
+            var els=document.querySelectorAll('button, a, div[role=button], span');
             for(var e of els){
-                var t=(e.innerText||e.textContent||e.value||'').trim().toLowerCase();
-                if(t.includes('renew')||t.includes('extend')||t.includes('续期'))return e;
+                var t=(e.innerText||e.textContent||'').trim();
+                if(t.toLowerCase().includes('renew')||t.toLowerCase().includes('extend')||t.includes('续期'))return e;
             }
             return null;
         """)
         if btn:
-            log("✅ JS 找到")
+            log("✅ JS 找到续期按钮")
             return btn
     except:
         pass
     return None
 
 
-def find_and_click(sb, keywords):
-    """JS查找包含关键字的按钮并点击"""
-    import json as _json
-    kw_json = _json.dumps(keywords, ensure_ascii=False)
-    result = sb.execute_script(f"""
-        var btns=Array.from(document.querySelectorAll('button, a, div[role=button], span, input[type=submit]'));
-        var kw={kw_json};
-        var found=btns.find(function(b){{
-            var t=(b.innerText||b.textContent||b.value||'').trim().toLowerCase();
-            return kw.some(function(k){{return t.includes(k);}});
-        }});
-        return found||null;
-    """)
-    if result:
-        sb.execute_script("arguments[0].scrollIntoView({block:'center'});", result)
-        time.sleep(0.5)
-        sb.execute_script("arguments[0].click()", result)
-        return True
-    return False
+def do_renew(sb):
+    log(f"🌐 打开服务器页面 {SERVER_ID}...")
+    sb.uc_open_with_reconnect(DASHBOARD_URL, 3)
+    time.sleep(8)
 
+    # 关掉弹窗广告
+    for i in range(3):
+        time.sleep(2)
+        try:
+            for target in ['div:contains("Close")', 'span:contains("Close")', 'a:contains("Close")', 'button:contains("Hide")']:
+                if sb.is_element_visible(target):
+                    log("🧹 关广告")
+                    sb.js_click(target)
+                    time.sleep(2)
+                    break
+        except:
+            pass
 
-def get_verification_code():
-    """从Gmail读取最新的验证码"""
-    log("📧 连接Gmail IMAP...")
-    try:
-        imap = imaplib.IMAP4_SSL("imap.gmail.com")
-        imap.login(EMAIL, GMAIL_APP_PASSWORD)
-        log("✅ Gmail登录成功")
-    except Exception as e:
-        log(f"❌ Gmail登录失败: {e}")
-        return None
+    # 滚到底部
+    sb.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    time.sleep(2)
 
-    for attempt in range(8):
-        log(f"📧 搜索验证码邮件 (尝试 {attempt+1}/8)...")
-        imap.select("INBOX")
-
-        # 搜索最近10分钟的邮件
-        status, messages = imap.search(None, f'(SINCE "{time.strftime("%d-%b-%Y")}" (FROM "noreply" OR SUBJECT "verify" OR SUBJECT "verification" OR SUBJECT "code"))')
-        if status != "OK":
-            log(f"⚠️ 搜索失败: {messages}")
-            time.sleep(8)
-            continue
-
-        msg_ids = messages[0].split()
-        if not msg_ids:
-            log("⚠️ 未找到验证码邮件")
-            time.sleep(8)
-            continue
-
-        for msg_id in reversed(msg_ids):
-            status, msg_data = imap.fetch(msg_id, "(RFC822)")
-            if status != "OK":
-                continue
-            raw = msg_data[0][1]
-            msg = email.message_from_bytes(raw)
-
-            body = ""
-            if msg.is_multipart():
-                for part in msg.walk():
-                    if part.get_content_type() == "text/plain":
-                        body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
-                        break
-            else:
-                body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
-
-            codes = re.findall(r'\b[0-9]{6}\b', body)
-            if codes:
-                code = codes[0]
-                log(f"✅ 找到验证码: {code}")
-                imap.logout()
-                return code
-
-            codes = re.findall(r'\b[0-9]{4,8}\b', body)
-            if codes:
-                code = codes[0]
-                log(f"✅ 找到验证码(变长): {code}")
-                imap.logout()
-                return code
-
-        log("⚠️ 未找到6位验证码，等待...")
+    # 处理跳转广告
+    if "google_vignette" in sb.get_current_url():
+        log("⚠️ 跳转广告, 刷新...")
+        sb.refresh()
         time.sleep(8)
+        sb.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(2)
 
-    imap.logout()
-    log("❌ 超时未获取验证码")
-    return None
+    shot(sb, "server_page")
+
+    btn = find_renew_btn(sb)
+    if not btn:
+        log("❌ 未找到续期按钮")
+        tx = sb.execute_script("return document.body.innerText||''")
+        log(f"页面内容: {tx[:500]}")
+        shot(sb, "no_btn")
+        return False
+
+    log("🖱️ 点击续期...")
+    try:
+        sb.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+        time.sleep(1)
+        sb.js_click(btn)
+    except Exception as e:
+        log(f"⚠️ 点击: {e}")
+        try:
+            sb.execute_script("arguments[0].click()", btn)
+        except:
+            pass
+    time.sleep(8)
+
+    # 处理弹窗Turnstile
+    try:
+        cf_sel = 'iframe[title*="Cloudflare"], iframe[src*="challenge"], iframe[src*="turnstile"]'
+        if sb.is_element_present(cf_sel):
+            sb.uc_gui_click_captcha()
+            time.sleep(2)
+            sb.uc_click(cf_sel)
+    except Exception as e:
+        log(f"⚠️ 弹窗CF: {e}")
+
+    time.sleep(25)
+    shot(sb, "renew_done")
+
+    # 检查续期结果
+    tx = sb.execute_script("return document.body.innerText||''")
+    log(f"📋 页面内容({len(tx)}c):")
+    for line in tx.split("\n"):
+        line = line.strip()
+        if any(k in line.lower() for k in ["renewed", "renew", "expire", "expiry", "just", "last"]):
+            log(f"  → {line}")
+
+    log("🎉 续期流程完成")
+    return True
 
 
 def main():
     log("=" * 40)
-    log("Zampto 续期 v6.1")
+    log("Zampto 续期 v7.0")
     log("=" * 40)
     log(f"📌 服务器: {SERVER_ID}")
-    log(f"📧 Gmail验证码: {'✅' if GMAIL_APP_PASSWORD else '❌ 未配置'}")
 
     if PROXY:
         try:
-            r = requests.get("https://api.ipify.org", proxies=proxy_dict(), timeout=10)
+            r = requests.get("https://api.ipify.org", proxies={"http": PROXY, "https": PROXY}, timeout=10)
             log(f"🌐 IP: {r.text.strip()}")
         except:
-            log("⚠️ 代理不可用")
+            log("⚠️ 代理测试失败")
 
+    # 清理代理环境变量(浏览器不用)
     for k in list(os.environ.keys()):
         if "proxy" in k.lower():
             os.environ.pop(k, None)
@@ -233,174 +273,20 @@ def main():
             log("✅ 浏览器就绪")
             time.sleep(2)
 
-            if not nav(sb, BASE_URL, 25):
-                log("❌ 首页打不开")
-                send_tg("首页打不开", "❌")
+            if not login(sb):
+                log("❌ 登录失败")
+                send_tg("登录失败", "❌")
                 return
-            time.sleep(2)
-
-            # 导航到登录页
-            if not nav(sb, f"{BASE_URL}/auth/login", 25):
-                log("❌ 登录页打不开")
-                return
-            time.sleep(2)
-
-            tx = innerText(sb)
-            src = sb.get_page_source() or ""
-            has_email_code = any(kw in tx.lower() for kw in ["email code", "verification", "验证码"])
-            has_password = 'input[type="password"]' in src or 'name="password"' in src
-            log(f"  页面: 邮箱验证码={'✅' if has_email_code else '❌'}, 密码表单={'✅' if has_password else '❌'}")
-
-            if has_password and not has_email_code:
-                # 密码登录
-                log("🔐 密码登录...")
-                try:
-                    sb.type('input[name="email"], input[type="email"]', EMAIL, timeout=5)
-                    sb.type('input[name="password"], input[type="password"]', PASSWORD, timeout=5)
-                    log("✅ 已填写")
-                    time.sleep(1)
-                except Exception as e:
-                    log(f"⚠️ 填写失败: {e}")
-
-                try:
-                    sb.uc_gui_click_captcha()
-                    time.sleep(4)
-                    log("✅ Turnstile 已处理")
-                except Exception as e:
-                    log(f"⚠️ Turnstile: {e}")
-
-                find_and_click(sb, ["login", "登录", "submit"])
-                time.sleep(8)
-
-                u = get_url(sb)
-                if "login" in u.lower() or "auth" in u.lower():
-                    log("❌ 密码登录失败")
-                    shot(sb, "pwd_fail")
-                    return False
-                log("✅ 密码登录成功")
-            elif has_email_code or not has_password:
-                # 邮箱验证码登录
-                log("📧 邮箱验证码登录...")
-
-                # 确认邮箱已填
-                try:
-                    sb.type('input[name="email"], input[type="email"]', EMAIL, timeout=5)
-                    log("✅ 已填邮箱")
-                except Exception as e:
-                    log(f"⚠️ 填邮箱: {e}")
-                time.sleep(1)
-
-                # 点击 Email Code 按钮
-                if find_and_click(sb, ["email code", "email", "验证码", "verification"]):
-                    log("✅ 已点击邮箱验证码")
-                    time.sleep(2)
-                else:
-                    log("⚠️ 未找到Email Code按钮，继续...")
-
-                # 点击发送验证码
-                if find_and_click(sb, ["send", "request", "获取", "发送", "get code", "获取验证码"]):
-                    log("✅ 已点击发送验证码")
-                    time.sleep(2)
-                else:
-                    log("⚠️ 未找到发送按钮")
-
-                if not GMAIL_APP_PASSWORD:
-                    log("❌ 未配置GMAIL_APP_PASSWORD")
-                    shot(sb, "no_app_pwd")
-                    send_tg("登录失败：未配置Gmail应用密码", "❌")
-                    return
-
-                code = get_verification_code()
-                if not code:
-                    shot(sb, "no_code")
-                    return
-
-                # 填入验证码
-                try:
-                    sb.type('input[name="code"], input[name="otp"], input[name="verification_code"]', code, timeout=5)
-                    log(f"✅ 填入验证码: {code}")
-                except:
-                    try:
-                        sb.execute_script(f"""
-                            var inputs=document.querySelectorAll('input');
-                            for(var i of inputs){{
-                                if((i.type==='text'||i.type==='number'||!i.type)&&!i.value){{
-                                    i.value='{code}';i.dispatchEvent(new Event('input',{{bubbles:true}}));break;
-                                }}
-                            }}
-                        """)
-                        log(f"✅ JS填入验证码: {code}")
-                    except Exception as e:
-                        log(f"⚠️ 填入验证码: {e}")
-                time.sleep(2)
-
-                # 提交
-                find_and_click(sb, ["verify", "确认", "login", "登录", "submit", "验证"])
-                time.sleep(8)
-
-                u = get_url(sb)
-                tx = innerText(sb).lower()
-                log(f"📌 {u} ({len(tx)}c)")
-                if any(k in tx for k in ["dashboard", "服务器", "server", "expire", "renew"]):
-                    log("✅ 验证码登录成功")
-                elif "login" in u.lower() or "auth" in u.lower():
-                    log("❌ 仍在登录页")
-                    shot(sb, "code_fail")
-                    return
-                else:
-                    log("✅ 登录成功")
 
             time.sleep(3)
             log("✅ 已登录")
-            shot(sb, "logged_in")
 
-            # ===== 续期 =====
-            u = f"{BASE_URL}/server?id={SERVER_ID}"
-            if not nav(sb, u, 25):
-                return
-            shot(sb, "server")
-            time.sleep(5)
-
-            tx = innerText(sb)
-            log(f"📄 {tx[:400]}")
-
-            btn = find_btn(sb)
-            if not btn:
-                log("❌ 未找到续期按钮")
-                shot(sb, "no_btn")
-                send_tg("找不到续期按钮", "❌")
-                return
-
-            log("🖱️ 点击续期...")
-            try:
-                sb.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-                time.sleep(1)
-                sb.execute_script("arguments[0].click()", btn)
-                log("✅ 点击成功")
-            except Exception as e:
-                log(f"⚠️ JS点击: {e}")
-            time.sleep(5)
-
-            shot(sb, "clicked")
-            tl = innerText(sb).lower()
-
-            if "security verification" in tl or "verify you are human" in tl:
-                log("🔐 处理弹窗...")
-                try:
-                    sb.uc_gui_click_captcha()
-                    time.sleep(5)
-                except:
-                    pass
-                time.sleep(3)
-
-            tx = innerText(sb)
-            for l in tx.split("\n"):
-                l = l.strip()
-                if any(k in l.lower() for k in ["last renewed", "just renewed", "renewed", "expire", "expiry"]):
-                    log(f"📋 {l}")
-            shot(sb, "result")
-            log("🎉 续期完成")
-            send_tg("续期完成", "✅")
+            if do_renew(sb):
+                log("🎉 续期完成")
+                send_tg("续期完成", "✅")
+            else:
+                log("⚠️ 续期流程有问题")
+                send_tg("续期流程有问题, 请查看截图", "⚠️")
 
     except Exception as e:
         import traceback
