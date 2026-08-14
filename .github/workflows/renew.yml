@@ -25,14 +25,17 @@ jobs:
       - name: Install Python dependencies
         run: pip install requests
 
-      - name: Setup proxy (NODE_LINK)
-        if: ${{ secrets.NODE_LINK != '' }}
+      - name: Setup proxy
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
-          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
-          echo "ALL_PROXY=http://127.0.0.1:1081" >> $GITHUB_ENV
-          echo "HTTPS_PROXY=http://127.0.0.1:1081" >> $GITHUB_ENV
+          if [ -n "$NODE_LINK" ]; then
+            bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+            echo "ALL_PROXY=http://127.0.0.1:1081" >> $GITHUB_ENV
+            echo "HTTPS_PROXY=http://127.0.0.1:1081" >> $GITHUB_ENV
+          else
+            echo "NODE_LINK not set, skipping proxy"
+          fi
 
       - name: Run renew script
         env:
