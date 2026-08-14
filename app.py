@@ -175,22 +175,14 @@ def handle_turnstile(sb) -> bool:
     return False
 
 def wait_for_login_form(sb, timeout=60):
-    """等待登录表单加载，支持 Cloudflare 挑战页面和正常登录页面"""
+    """等待登录表单加载"""
     print(f"⏳ 等待页面加载（最长 {timeout}s）...")
     for i in range(timeout):
         try:
-            # 检查页面标题/内容
-            title = sb.get_page_title() or ""
             page_src = (sb.get_page_source() or "").lower()
 
-            # 检查是否还在 Cloudflare 挑战页
-            if 'just a moment' in page_src.lower() or 'checking your browser' in page_src.lower():
-                print(f"🔄 第 {i+1}s: 仍在 Cloudflare 验证中...")
-                time.sleep(1)
-                continue
-
-            # 检查是否出现登录表单
-            if 'input name="email"' in page_src or 'name="email"' in page_src:
+            # 检查登录表单元素（zampto 使用 id="email" 而非 name="email"）
+            if 'id="email"' in page_src or 'type="email"' in page_src:
                 print(f"✅ 登录表单已加载（{i+1}s）")
                 return True
 
@@ -217,12 +209,8 @@ def has_cf_challenge(sb):
     """检测当前页面是否是 Cloudflare 挑战页面"""
     try:
         title = sb.get_page_title() or ""
-        src = (sb.get_page_source() or "").lower()
-        if 'just a moment' in title.lower() or 'just a moment' in src:
-            return True
-        if 'checking your browser' in src:
-            return True
-        if 'cf-browser-verification' in src or 'challenge-platform' in src:
+        # 只检查 title，不检查源码（源码中可能包含误匹配文本）
+        if 'just a moment' in title.lower():
             return True
         return False
     except Exception:
@@ -271,14 +259,14 @@ def login(sb) -> bool:
             print(f"❌ 第二次打开页面失败: {e}")
             return False
 
-    # 填写邮箱
+    # 填写邮箱（zampto 使用 id="email" 而非 name="email"）
     print("📧 填写邮箱...")
-    js_fill_input(sb, 'input[name="email"]', EMAIL)
+    js_fill_input(sb, '#email', EMAIL)
     time.sleep(0.3)
 
-    # 填写密码
+    # 填写密码（zampto 使用 id="password" 而非 name="password"）
     print("🔑 填写密码...")
-    js_fill_input(sb, 'input[name="password"]', PASSWORD)
+    js_fill_input(sb, '#password', PASSWORD)
     time.sleep(1)
 
     # 等待 Turnstile 出现
@@ -302,7 +290,7 @@ def login(sb) -> bool:
         sb.click('button[type="submit"]')
     except Exception:
         try:
-            sb.press_keys('input[name="password"]', '\n')
+            sb.press_keys('#password', '\n')
         except Exception:
             pass
 
