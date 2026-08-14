@@ -124,11 +124,12 @@ def find_btn(sb):
 
 
 def find_and_click(sb, keywords):
-    """JS查找包含关键字的按钮并点击 - 用find()避免非法return"""
-    kw_args = ", ".join([f"'{kw}'" for kw in keywords])
+    """JS查找包含关键字的按钮并点击"""
+    import json as _json
+    kw_json = _json.dumps(keywords, ensure_ascii=False)
     result = sb.execute_script(f"""
         var btns=Array.from(document.querySelectorAll('button, a, div[role=button], span, input[type=submit]'));
-        var kw=['{kw_args}'];
+        var kw={kw_json};
         var found=btns.find(function(b){{
             var t=(b.innerText||b.textContent||b.value||'').trim().toLowerCase();
             return kw.some(function(k){{return t.includes(k);}});
