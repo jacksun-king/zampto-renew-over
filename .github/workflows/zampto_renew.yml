@@ -44,6 +44,7 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           SERVER_ID: ${{ vars.SERVER_ID || '13421' }}
           ALL_PROXY: http://127.0.0.1:1081
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
             python3 zampto_renew.py
