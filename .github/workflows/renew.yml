@@ -12,7 +12,7 @@ permissions:
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v6
@@ -22,18 +22,8 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk \
-            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
-            libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
-            libxfixes3 libxrandr2 libgbm1 libasound2t64
-
       - name: Install Python dependencies
-        run: |
-          pip install seleniumbase requests
-          seleniumbase install chromedriver
+        run: pip install requests
 
       - name: Setup proxy (NODE_LINK)
         if: ${{ secrets.NODE_LINK != '' }}
@@ -46,24 +36,16 @@ jobs:
 
       - name: Run renew script
         env:
-          ZAMPTO_EMAIL: ${{ secrets.ZAMPTO_EMAIL }}
-          ZAMPTO_PASSWORD: ${{ secrets.ZAMPTO_PASSWORD }}
           ZAMTO_COOKIE: ${{ secrets.ZAMTO_COOKIE }}
+          ZAMPTO_EMAIL: ${{ secrets.ZAMPTO_EMAIL }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           SERVER_ID: ${{ vars.SERVER_ID || '13421' }}
-          ALL_PROXY: ${{ env.ALL_PROXY }}
-        run: |
-          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
-            python3 app.py
+        run: python3 app.py
 
       - name: Cleanup
         if: always()
-        run: |
-          pkill -f chromedriver 2>/dev/null || true
-          pkill -f chrome 2>/dev/null || true
-          pkill -f Xvfb 2>/dev/null || true
-          pkill -f sing-box 2>/dev/null || true
+        run: pkill -f sing-box 2>/dev/null || true
 
       - name: Clean old workflow runs
         if: always()
