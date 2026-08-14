@@ -304,10 +304,27 @@ def login(sb) -> bool:
     login_url = f"{BASE_URL}/auth/login"
     print(f"🌐 打开登录页面: {login_url}")
 
-    # 使用 uc_open_with_reconnect 处理 Cloudflare
-    # reconnect_time 每次重连等待秒数，总耗时 reconnect_time * 尝试次数
-    sb.uc_open_with_reconnect(login_url, reconnect_time=10)
-    time.sleep(3)
+    # 先用 sb.open() 加载页面（uc_open_with_reconnect 的 window.open 会阻止 Turnstile 加载）
+    # 如果遇到 Cloudflare 挑战页，再回退到 uc_open_with_reconnect
+    try:
+        sb.open(login_url)
+        time.sleep(3)
+    except Exception as e:
+        print(f"⚠️ sb.open() 异常: {e}，回退到 uc_open_with_reconnect")
+        sb.uc_open_with_reconnect(login_url, reconnect_time=10)
+        time.sleep(3)
+
+    # 调试：检查页面是否包含 Turnstile 相关元素
+    ts_check = sb.execute_script("""
+        return JSON.stringify({
+            hasTurnstileInput: !!document.querySelector('input[name="cf-turnstile-response"]'),
+            hasChallengesCDN: document.documentElement.innerHTML.includes('challenges.cloudflare.com'),
+            hasCfTurnstile: document.documentElement.innerHTML.includes('cf-turnstile'),
+            pageUrl: window.location.href,
+            bodyLen: (document.body && document.body.innerHTML.length) || 0
+        });
+    """)
+    print(f"🔍 页面调试信息: {ts_check}")
 
     # 检查是否还在 Cloudflare 挑战页
     if has_cf_challenge(sb):
@@ -322,7 +339,7 @@ def login(sb) -> bool:
 
     # 等待登录表单加载
     if not wait_for_login_form(sb, timeout=60):
-        # 尝试再次使用 uc_open_with_reconnect
+        # 尝试使用 uc_open_with_reconnect
         print("🔄 首次加载失败，再次尝试 uc_open_with_reconnect...")
         try:
             sb.uc_open_with_reconnect(login_url, reconnect_time=15)
@@ -420,8 +437,13 @@ def renew_server(sb) -> bool:
     """登录成功后进入服务器页面并触发续期"""
     server_url = f"{BASE_URL}/server?id={SERVER_ID}"
     print(f"\n🌐 打开服务器页面: {server_url}")
-    sb.uc_open_with_reconnect(server_url, reconnect_time=10)
-    time.sleep(5)
+    try:
+        sb.open(server_url)
+        time.sleep(5)
+    except Exception:
+        print("⚠️ sb.open() 异常，回退到 uc_open_with_reconnect")
+        sb.uc_open_with_reconnect(server_url, reconnect_time=10)
+        time.sleep(5)
 
     if not wait_for_login_form(sb, timeout=30):
         print("⚠️ 服务器页面加载异常，继续尝试...")
