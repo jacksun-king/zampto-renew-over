@@ -125,11 +125,12 @@ def find_btn(sb):
 
 def find_and_click(sb, keywords):
     """JS查找包含关键字的按钮并点击"""
+    kw_str = " || ".join([f"t.includes('{kw}')" for kw in keywords])
     result = sb.execute_script(f"""
         var btns=document.querySelectorAll('button, a, div[role=button], span, input[type=submit]');
         for(var b of btns){{
             var t=(b.innerText||b.textContent||b.value||'').trim().toLowerCase();
-            {'; '.join([f"if(t.includes('{kw}'))return b;" for kw in keywords])}
+            if({kw_str}){{return b;}}
         }}
         return null;
     """)
