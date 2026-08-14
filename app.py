@@ -223,15 +223,80 @@ def login_with_password(sb):
 # ===== 续期 =====
 def renew_server(sb):
     """在浏览器中点击续期按钮"""
-    log("🌐 打开服务器页面...")
+    # 先打开服务器列表
+    log("🌐 打开服务器列表...")
     try:
-        sb.open(DASHBOARD_URL, timeout=30000)
+        sb.open(f"{BASE_URL}/servers", timeout=20000)
+        time.sleep(3)
     except Exception:
         pass
-    time.sleep(5)
+    shot(sb, "servers_list")
+
+    # 如果当前在服务器列表，点击第一个服务器卡片进入详情
+    cur_url = sb.get_current_url()
+    log(f"📌 当前 URL: {cur_url}")
+
+    if "/servers" in cur_url and "id=" not in cur_url:
+        log("👆 在服务器列表页，尝试点击服务器卡片...")
+        try:
+            # 查找服务器卡片或链接
+            card_selectors = [
+                'a[href*="/server/"]',
+                'a[href*="/server?id="]',
+                'a[href*="/servers/"]',
+                'a:has(h3), a:has(h4)',
+                'div[role="button"]:has(h3), div[role="button"]:has(h4)',
+                'div.cursor-pointer',
+                'div.card, div[class*="card"]',
+            ]
+            clicked = False
+            for sel in card_selectors:
+                try:
+                    elem = sb.find_element(sel, timeout=3)
+                    if elem:
+                        sb.click(sel)
+                        log(f"  ✅ 点击: {sel}")
+                        clicked = True
+                        time.sleep(3)
+                        break
+                except Exception:
+                    continue
+
+            if not clicked:
+                # 尝试点击整个页面中的第一个可点击的卡片
+                try:
+                    # 找所有链接
+                    links = sb.find_elements("a")
+                    for link in links:
+                        href = link.get_attribute("href") or ""
+                        txt = (link.text or "").strip()
+                        if "/server" in href.lower() and txt:
+                            sb.execute_script("arguments[0].click()", link)
+                            log(f"  ✅ 点击链接: {txt}")
+                            clicked = True
+                            time.sleep(3)
+                            break
+                except Exception:
+                    pass
+
+            if not clicked:
+                log("⚠️ 未找到服务器卡片，尝试直接打开服务器详情页")
+                for url_try in [f"{BASE_URL}/server?id={SERVER_ID}", f"{BASE_URL}/server/{SERVER_ID}"]:
+                    try:
+                        sb.open(url_try, timeout=20000)
+                        time.sleep(3)
+                        break
+                    except Exception:
+                        continue
+
+        except Exception as e:
+            log(f"⚠️ 点击服务器卡片失败: {e}")
 
     shot(sb, "server_page")
+    cur_url = sb.get_current_url()
+    log(f"📌 服务器页 URL: {cur_url}")
 
+    # 查找续期按钮
     log("🔍 查找续期按钮...")
     found = False
     btn_selectors = [
@@ -239,9 +304,12 @@ def renew_server(sb):
         'button:contains("Renew")',
         'button:contains("renew")',
         'button:contains("续期")',
+        'button:contains("Extend")',
+        'button:contains("extend")',
         'button.w-full.bg-gradient-to-r',
         'button[data-slot="button"]:has(svg.lucide-repeat)',
-        'button[data-slot="button"]:has(svg)',
+        'button[aria-label*="renew" i]',
+        'button[title*="renew" i]',
     ]
 
     for sel in btn_selectors:
@@ -258,7 +326,7 @@ def renew_server(sb):
         try:
             for btn in sb.find_elements("button"):
                 txt = (btn.text or "").strip()
-                if "renew" in txt.lower() or "续期" in txt:
+                if txt and ("renew" in txt.lower() or "续期" in txt or "extend" in txt.lower()):
                     log(f"  找到按钮文本: {txt}")
                     found = True
                     break
@@ -268,10 +336,16 @@ def renew_server(sb):
     if not found:
         log("❌ 未找到续期按钮")
         shot(sb, "no_renew_btn")
-        # 保存页面源码
+        # 保存页面源码分析
         try:
             with open("page_source.html", "w") as f:
                 f.write(sb.get_page_source())
+        except Exception:
+            pass
+        # 尝试打印页面可见文本
+        try:
+            body_text = sb.get_text("body") or ""
+            log(f"📄 页面文本片段: {body_text[:300]}")
         except Exception:
             pass
         return False
@@ -279,7 +353,6 @@ def renew_server(sb):
     # 点击续期
     log("🖱️ 点击续期按钮...")
     try:
-        # 滚动到按钮
         sb.execute_script(
             "arguments[0].scrollIntoView({behavior:'smooth',block:'center'});",
             sb.find_element('button:contains("Renew")')
