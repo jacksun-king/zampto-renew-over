@@ -145,17 +145,100 @@ def _activate_window():
             pass
 
 def handle_turnstile(sb) -> bool:
+    """处理 Cloudflare Turnstile 验证
+    
+    策略（按优先级）：
+    1. 先检查是否已静默通过
+    2. 用 JS 直接触发 turnstile.execute() 获取 token（不依赖 iframe 渲染）
+    3. 用 JS 渲染 + 重新触发（remove + render + execute）
+    4. 回退到 uc_gui_click_captcha() 物理点击
+    """
     print("🔍 处理 Cloudflare Turnstile 验证...")
     time.sleep(2)
+
+    # 1. 检查是否已静默通过
     if sb.execute_script(_SOLVED_JS):
         print("✅ 已静默通过")
         return True
+
+    # 2. 尝试 turnstile.execute() API 直接获取 token
+    print("🔄 尝试 turnstile.execute() API 直接获取 token...")
+    ts_token = sb.execute_async_script("""
+    var cb = arguments[arguments.length - 1];
+    var container = document.querySelector('input[name="cf-turnstile-response"]');
+    if (!container) {
+        cb('NO_INPUT');
+        return;
+    }
+    var parent = container.parentElement;
+    var timeout = setTimeout(function() {
+        cb('TIMEOUT');
+    }, 25000);
+    
+    window.turnstile.execute(parent, {
+        sitekey: '0x4AAAAAAD5hn7QjjDUPXOcK',
+        callback: function(t) {
+            clearTimeout(timeout);
+            container.value = t;
+            cb('SUCCESS:' + t);
+        },
+        'error-callback': function(err) {
+            clearTimeout(timeout);
+            cb('ERROR:' + String(err));
+        }
+    });
+    """)
+    print(f"  turnstile.execute() 结果: {ts_token}")
+    if isinstance(ts_token, str) and ts_token.startswith('SUCCESS:'):
+        print(f"✅ turnstile.execute() 成功获取 token")
+        return True
+
+    # 3. 尝试 remove + render + execute（重新渲染后再执行）
+    print("🔄 尝试 remove + render(execute模式) 重新触发...")
+    ts_token2 = sb.execute_async_script("""
+    var cb = arguments[arguments.length - 1];
+    var container = document.querySelector('input[name="cf-turnstile-response"]');
+    if (!container) {
+        cb('NO_INPUT');
+        return;
+    }
+    var parent = container.parentElement;
+    // 先移除旧的 widget
+    try { window.turnstile.remove(parent); } catch(e) {}
+    
+    var timeout = setTimeout(function() {
+        cb('TIMEOUT');
+    }, 25000);
+    
+    window.turnstile.render(parent, {
+        sitekey: '0x4AAAAAAD5hn7QjjDUPXOcK',
+        execution: 'execute',
+        callback: function(t) {
+            clearTimeout(timeout);
+            container.value = t;
+            cb('SUCCESS:' + t);
+        },
+        'error-callback': function(err) {
+            clearTimeout(timeout);
+            cb('ERROR:' + String(err));
+        }
+    });
+    """)
+    print(f"  remove+render 结果: {ts_token2}")
+    if isinstance(ts_token2, str) and ts_token2.startswith('SUCCESS:'):
+        print(f"✅ remove+render 成功获取 token")
+        return True
+
+    # 4. 尝试展开 Turnstile（防止被父容器 overflow:hidden 裁剪）
+    print("🔄 尝试展开 Turnstile 容器...")
     for _ in range(3):
         try:
             sb.execute_script(_EXPAND_JS)
         except Exception:
             pass
         time.sleep(0.5)
+
+    # 5. 使用 SeleniumBase 内置 uc_gui_click_captcha 处理 Turnstile
     for attempt in range(6):
         if sb.execute_script(_SOLVED_JS):
             print(f"✅ Turnstile 通过（第 {attempt + 1} 次尝试）")
