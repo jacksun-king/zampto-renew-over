@@ -135,9 +135,15 @@ def get_server_info(session):
                     # 处理返回格式
                     if isinstance(data, dict):
                         if "servers" in data:
+                            # 列表模式 - 找匹配的服务器
                             for srv in data["servers"]:
                                 if str(srv.get("id")) == str(SERVER_ID):
                                     return srv
+                            # 没找到匹配 ID，用第一个
+                            if data["servers"]:
+                                srv = data["servers"][0]
+                                log(f"  ⚠️ 未找到 SERVER_ID={SERVER_ID}，使用第一个: id={srv.get('id')} name={srv.get('name')}")
+                                return srv
                         elif "data" in data:
                             return data["data"]
                         else:
@@ -147,8 +153,6 @@ def get_server_info(session):
                     continue
             elif r.status_code == 403:
                 log(f"  {path} -> 403 (IP 被拦)")
-                # 403 说明路径存在但被 Cloudflare 拦了
-                # 继续尝试其他路径，但记住这个路径
             else:
                 log(f"  {path} -> {r.status_code}")
         except Exception as e:
@@ -165,9 +169,16 @@ def renew_server(session):
     if not csrf:
         log("⚠️ 无法获取 CSRF token，仍尝试续期")
     
-    # 尝试多种 body 格式
-    renew_url = f"{BASE_URL}/api/server/renew"
+    # 尝试多种路径和 body 格式
+    # 参考 weikkadd/zampto: POST /api/server/{id}/renew
+    path_variants = [
+        f"/api/server/{SERVER_ID}/renew",
+        f"/api/servers/{SERVER_ID}/renew",
+        f"/api/server/renew",
+        f"/api/servers/renew",
+    ]
     body_variants = [
+        {},
         {"server_id": SERVER_ID},
         {"server_id": int(SERVER_ID)},
         {"id": SERVER_ID},
@@ -176,32 +187,35 @@ def renew_server(session):
         {"server": SERVER_ID},
     ]
     
-    for body in body_variants:
-        try:
-            # 每次 POST 前刷新 CSRF
-            fresh_csrf = refresh_csrf(session) or csrf
-            headers = {"X-CSRF-Token": fresh_csrf} if fresh_csrf else {}
-            
-            r = session.post(renew_url, json=body, timeout=15, headers=headers)
-            log(f"  POST body={body} -> {r.status_code}")
-            
-            if r.status_code in [200, 201, 202, 204]:
-                try:
-                    resp = r.json()
-                    log(f"  ✅ 响应: {json.dumps(resp, ensure_ascii=False)[:200]}")
-                except Exception:
-                    log(f"  ✅ 响应: {r.text[:200]}")
-                return True
-            
-            # 检查是否需要 captcha
-            if "captcha" in r.text.lower() or "verification" in r.text.lower():
-                log(f"  ❌ 需要 captcha: {r.text[:200]}")
-                return False
+    for path in path_variants:
+        for body in body_variants:
+            try:
+                renew_url = f"{BASE_URL}{path}"
+                # 每次 POST 前刷新 CSRF
+                fresh_csrf = refresh_csrf(session) or csrf
+                headers = {"X-CSRF-Token": fresh_csrf} if fresh_csrf else {}
                 
-        except Exception as e:
-            log(f"  body={body} 异常: {e}")
+                r = session.post(renew_url, json=body, timeout=15, headers=headers)
+                skip = body.get("server_id", body.get("id", body.get("server", "{}")))
+                log(f"  POST {path} body={body} -> {r.status_code}")
+                
+                if r.status_code in [200, 201, 202, 204]:
+                    try:
+                        resp = r.json()
+                        log(f"  ✅ 响应: {json.dumps(resp, ensure_ascii=False)[:200]}")
+                    except Exception:
+                        log(f"  ✅ 响应: {r.text[:200]}")
+                    return True
+                
+                # 检查是否需要 captcha
+                if "captcha" in r.text.lower() or "verification" in r.text.lower():
+                    log(f"  ❌ 需要 captcha: {r.text[:200]}")
+                    continue  # 换个路径试试
+                    
+            except Exception as e:
+                log(f"  {path} body={body} 异常: {e}")
     
-    log("❌ 所有 body 格式均失败")
+    log("❌ 所有组合均失败")
     return False
 
 # ===== 主入口 =====
