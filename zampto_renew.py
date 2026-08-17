@@ -243,14 +243,28 @@ def login(sb) -> bool:
     sb.update_text(PASSWORD_SELECTOR, PASSWORD)
     time.sleep(1)
 
-    # Turnstile
-    try:
-        has_ts = sb.execute_script(_EXISTS_JS)
-    except Exception:
-        has_ts = False
+    # 等待 Turnstile 出现 (异步渲染, 最多 12s)
+    log("⏳ 等待 Turnstile 渲染...")
+    has_ts = False
+    for _ in range(12):
+        try:
+            has_ts = sb.execute_script(_EXISTS_JS)
+        except Exception:
+            has_ts = False
+        if has_ts:
+            break
+        # 页面文本检测 (Turnstile 组件可能未渲染出 input, 但出现验证提示)
+        try:
+            body_text = (sb.execute_script("return document.body ? document.body.innerText : ''") or "").lower()
+            if "security verification" in body_text or "verify you are human" in body_text or "verification below" in body_text:
+                has_ts = True
+                break
+        except Exception:
+            pass
+        time.sleep(1)
     if has_ts:
         log("🛡️ 检测到 Turnstile, 开始处理...")
-        if not handle_turnstile(sb, max_attempts=3, timeout_per_attempt=20):
+        if not handle_turnstile(sb, max_attempts=4, timeout_per_attempt=20):
             log("❌ Turnstile 失败")
             sb.save_screenshot("login_turnstile_fail.png")
             return False
@@ -283,7 +297,7 @@ def login(sb) -> bool:
 
     log("⏳ 等待登录结果...")
     login_paths = {"/auth/login", "/login"}
-    for i in range(30):
+    for i in range(35):
         time.sleep(1)
         try:
             current_url = sb.get_current_url()
@@ -299,6 +313,26 @@ def login(sb) -> bool:
                     log(f"❌ 账号或密码错误: {kw}")
                     sb.save_screenshot("login_failed.png")
                     return False
+            # 已点击提交但仍在登录页且出现 Turnstile → 二次处理
+            if i >= 3 and normalized in login_paths:
+                has_ts = False
+                try:
+                    has_ts = sb.execute_script(_EXISTS_JS) or ("security verification" in body_text or "verify you are human" in body_text or "verification below" in body_text)
+                except Exception:
+                    has_ts = "security verification" in body_text or "verify you are human" in body_text
+                if has_ts:
+                    log("🔄 提交后出现 Turnstile, 二次处理...")
+                    if handle_turnstile(sb, max_attempts=3, timeout_per_attempt=15):
+                        log("✅ Turnstile 已过, 重新提交...")
+                        try:
+                            for btn in sb.find_elements("button"):
+                                text = (btn.text or "").strip().lower()
+                                if text in {"sign in", "log in", "login", "登录", "continue", "submit", "进入", "登 录"}:
+                                    btn.click()
+                                    log(f"✅ 二次点击: '{text}'")
+                                    break
+                        except Exception:
+                            pass
         except Exception:
             pass
 
