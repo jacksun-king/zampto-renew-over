@@ -33,7 +33,7 @@ jobs:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
           if [ -n "$NODE_LINK" ]; then
-            bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+            bash setup_proxy.sh
           fi
 
       - name: Run renew
