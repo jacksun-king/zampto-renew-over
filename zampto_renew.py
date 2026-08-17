@@ -516,7 +516,7 @@ def main():
             os.environ.pop(k, None)
 
     try:
-        with SB(uc=True, headless2=True, incognito=False) as sb:
+        with SB(uc=True, headless=False, incognito=False) as sb:
             log("✅ 浏览器就绪")
             time.sleep(2)
 
