@@ -28,12 +28,15 @@ jobs:
           pip install seleniumbase requests
           seleniumbase install chromedriver
 
-      - name: Setup proxy
+      - name: Setup proxy (optional)
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
           if [ -n "$NODE_LINK" ]; then
             bash setup_proxy.sh
+            echo "ALL_PROXY=http://127.0.0.1:1081" >> $GITHUB_ENV
+          else
+            echo "No proxy configured, direct mode"
           fi
 
       - name: Run renew
@@ -43,7 +46,6 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           SERVER_ID: ${{ vars.SERVER_ID || '13421' }}
-          ALL_PROXY: http://127.0.0.1:1081
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
