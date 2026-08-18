@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Zampto 自动续期 - v8.1
-修复(2026-08-17):
-  1. 登录入口: auth.zampto.net/sign-in 已宕机(HTTP 522), 切回 dash.zampto.net/auth/login
-  2. execute_script 顶层 return 报 Illegal return statement, 全部改 IIFE 写法
-  3. Turnstile: 完整处理(cf-turnstile-response 填充检查 + uc_gui_click_captcha 循环)
-  4. 续期: XPath 定位 'Renew Server' 按钮 + 剩余时间对比确认成功
+Zampto 自动续期 - v8.2
+修复(2026-08-18):
+  1. Turnstile 组件显示 "temporarily unavailable" 时自动刷新重试(最多4轮),
+     不再傻点永远点不到的按钮
+  2. 登录流程返回 ok/bad_cred/retry 三态, 超时/组件不可用走重试
 """
 import os, time, json, re, imaplib, email, subprocess
 import requests
@@ -207,13 +206,43 @@ def extract_remaining_minutes(sb):
 # ============================================================
 # 登录
 # ============================================================
+def _body_lower(sb) -> str:
+    try:
+        return (sb.execute_script("return document.body ? document.body.innerText : ''") or "").lower()
+    except Exception:
+        return ""
+
+
+def _ts_unavailable(sb) -> bool:
+    """Turnstile 组件加载失败(临时不可用) — 页面会提示 reload the page"""
+    t = _body_lower(sb)
+    return ("temporarily unavailable" in t) or ("try reloading the page" in t) or ("we can't verify" in t)
+
+
 def login(sb) -> bool:
+    """登录(带 Turnstile unavailable 自动刷新重试)"""
+    for attempt in range(1, 5):
+        log(f"🔄 登录尝试 {attempt}/4")
+        r = _login_attempt(sb)
+        if r == "ok":
+            return True
+        if r == "bad_cred":
+            return False
+        # retry: Turnstile 临时不可用或失败
+        log(f"⚠️ 第{attempt}次未成功, 5s后重试...")
+        time.sleep(5)
+    log("❌ 登录重试次数用尽")
+    return False
+
+
+def _login_attempt(sb) -> str:
+    """单次登录尝试。返回 'ok' / 'bad_cred' / 'retry'"""
     log(f"🌐 打开登录页: {LOGIN_URL}")
     try:
         sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=8)
     except Exception as exc:
         log(f"⚠️ 打开登录页失败: {exc}")
-        return False
+        return "retry"
 
     log("⏳ 等待登录表单...")
     try:
@@ -224,7 +253,7 @@ def login(sb) -> bool:
         log(f"❌ 登录表单未加载: {exc}")
         log(f"当前 URL: {sb.get_current_url()}")
         sb.save_screenshot("login_form_fail.png")
-        return False
+        return "retry"
 
     # Cookie 同意
     try:
@@ -246,7 +275,7 @@ def login(sb) -> bool:
     # 等待 Turnstile 出现 (异步渲染, 最多 12s)
     log("⏳ 等待 Turnstile 渲染...")
     has_ts = False
-    for _ in range(12):
+    for _ in range(15):
         try:
             has_ts = sb.execute_script(_EXISTS_JS)
         except Exception:
@@ -263,13 +292,18 @@ def login(sb) -> bool:
             pass
         time.sleep(1)
     if has_ts:
+        # Turnstile 组件自身不可用 → 刷新页面重试整个登录流程
+        if _ts_unavailable(sb):
+            log("⚠️ Turnstile 组件暂时不可用, 将刷新重试...")
+            sb.save_screenshot("ts_unavailable.png")
+            return "retry"
         log("🛡️ 检测到 Turnstile, 开始处理...")
         if not handle_turnstile(sb, max_attempts=4, timeout_per_attempt=20):
             log("❌ Turnstile 失败")
             sb.save_screenshot("login_turnstile_fail.png")
-            return False
+            return "retry"
     else:
-        log("ℹ️ 未检测到 Turnstile")
+        log("ℹ️ 未检测到 Turnstile(继续提交, 若拦截会二次处理)")
 
     # 提交登录
     log("🖱️ 提交登录...")
@@ -293,7 +327,7 @@ def login(sb) -> bool:
             log("✅ 回车提交")
         except Exception as exc:
             log(f"⚠️ 回车提交: {exc}")
-            return False
+            return "retry"
 
     log("⏳ 等待登录结果...")
     login_paths = {"/auth/login", "/login"}
@@ -308,11 +342,16 @@ def login(sb) -> bool:
         # 错误检测
         try:
             body_text = (sb.execute_script("return document.body ? document.body.innerText : ''") or "").lower()
+            # Turnstile 组件不可用 → 整个流程刷新重试
+            if _ts_unavailable(sb):
+                log("⚠️ 提交后 Turnstile 组件不可用, 刷新重试...")
+                sb.save_screenshot("ts_unavailable_after.png")
+                return "retry"
             for kw in ("invalid email or password", "invalid credentials", "email or password is incorrect", "wrong password", "account not found"):
                 if kw in body_text:
                     log(f"❌ 账号或密码错误: {kw}")
                     sb.save_screenshot("login_failed.png")
-                    return False
+                    return "bad_cred"
             # 已点击提交但仍在登录页且出现 Turnstile → 二次处理
             if i >= 3 and normalized in login_paths:
                 has_ts = False
@@ -338,13 +377,13 @@ def login(sb) -> bool:
 
         if normalized not in login_paths:
             log("✅ 登录成功!")
-            return True
+            return "ok"
 
         # 登录表单消失也判成功
         try:
             if not sb.is_element_present(EMAIL_SELECTOR) and not sb.is_element_present(PASSWORD_SELECTOR):
                 log("✅ 表单已消失, 登录成功")
-                return True
+                return "ok"
         except Exception:
             pass
 
@@ -353,7 +392,7 @@ def login(sb) -> bool:
 
     log("❌ 登录超时")
     sb.save_screenshot("login_timeout.png")
-    return False
+    return "retry"
 
 
 # ============================================================
