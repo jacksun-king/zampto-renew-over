@@ -25,15 +25,71 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y google-chrome-stable xvfb x11-utils xdotool scrot fonts-noto-cjk
-          pip install seleniumbase requests
+          pip install seleniumbase requests pyyaml
           seleniumbase install chromedriver
 
-      - name: Setup proxy
+      - name: 🛡️ 启动代理（mihomo + 自动选住宅 IP 节点）
         env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}
+          GOST_PROXY: ${{ secrets.NODE_LINK }}
+          LOCAL_PROXY_PORT: "1080"
         run: |
-          if [ -n "$NODE_LINK" ]; then
-            bash setup_proxy.sh
+          set -e
+          if [ -z "$GOST_PROXY" ]; then
+            echo "ℹ️ 未配置 NODE_LINK，直连模式"
+            exit 0
+          fi
+          LOCAL_MIXED="socks5://127.0.0.1:${LOCAL_PROXY_PORT}"
+          echo "🌐 使用 mihomo 解析代理节点"
+          MIHOMO_VER="v1.18.10"
+          MIHOMO_URL="https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-amd64-${MIHOMO_VER}.gz"
+          if ! wget -q -T 30 "$MIHOMO_URL" -O mihomo.gz; then
+            echo "⚠️ GitHub 下载失败，尝试镜像..."
+            wget -q -T 30 "https://ghproxy.net/${MIHOMO_URL}" -O mihomo.gz
+          fi
+          gzip -dc mihomo.gz > mihomo 2>/dev/null || gunzip -f mihomo.gz
+          chmod +x mihomo
+          echo "📦 mihomo 版本: $(./mihomo -v | head -1)"
+          python3 parse_mihomo.py
+          nohup ./mihomo -f mihomo_config.yaml > mihomo.log 2>&1 &
+          sleep 5
+          echo "📝 mihomo 启动日志:"
+          tail -n 20 mihomo.log || true
+          echo "✅ mihomo 已启动于 $LOCAL_MIXED"
+          echo ""
+          echo "🔍 自动遍历节点，寻找台湾住宅 IP..."
+          NODES=$(python3 -c "
+          import json,urllib.request
+          with urllib.request.urlopen('http://127.0.0.1:9090/proxies/GLOBAL') as r:
+              d=json.load(r)
+          for n in d.get('all',[]):
+              if n not in ('DIRECT','REJECT','PASS','COMPATIBLE'):
+                  print(n)
+          ")
+          SELECTED=""
+          for node in $NODES; do
+            curl -s -m 5 -X PUT "http://127.0.0.1:9090/proxies/GLOBAL" -d "{\"name\":\"$node\"}" >/dev/null 2>&1
+            sleep 2
+            ORG=$(curl -s -m 12 -x "$LOCAL_MIXED" "https://ipinfo.io/json" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('org','').lower())" 2>/dev/null)
+            IP=$(curl -s -m 12 -x "$LOCAL_MIXED" "https://api.ipify.org" 2>/dev/null)
+            if echo "$ORG" | grep -qiE "(hinet|chunghwa|as3462|data communication)"; then
+              echo "✅ 住宅 IP 节点: $node → IP=$IP org=$ORG"
+              SELECTED="$node"
+              break
+            else
+              echo "⚠️ $node → IP=$IP org=$ORG（非住宅，跳过）"
+            fi
+          done
+          if [ -z "$SELECTED" ]; then
+            echo "⚠️ 未找到住宅 IP 节点，使用第一个台湾节点"
+            FIRST=$(echo "$NODES" | head -1)
+            curl -s -m 5 -X PUT "http://127.0.0.1:9090/proxies/GLOBAL" -d "{\"name\":\"$FIRST\"}" >/dev/null 2>&1
+            SELECTED="$FIRST"
+          fi
+          echo "🎯 选定节点: $SELECTED"
+          if OUT_IP=$(curl -s --connect-timeout 10 --max-time 15 -x "$LOCAL_MIXED" https://api.ipify.org); then
+            echo "✅ 最终出口 IP: $(echo "$OUT_IP" | sed 's/\([0-9]*\.[0-9]*\.\)[0-9]*\.[0-9]*/\1**.**/g')"
+          else
+            echo "⚠️ 代理连通测试失败"
           fi
 
       - name: Run renew
@@ -43,7 +99,7 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           SERVER_ID: ${{ vars.SERVER_ID || '13421' }}
-          ALL_PROXY: http://127.0.0.1:1081
+          ALL_PROXY: http://127.0.0.1:1080
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
@@ -54,7 +110,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: screenshots
-          path: "*.png"
+          path: |
+            *.png
+            mihomo.log
+            mihomo_config.yaml
           retention-days: 3
 
       - name: Cleanup
@@ -63,4 +122,5 @@ jobs:
           pkill -f chromedriver 2>/dev/null || true
           pkill -f chrome 2>/dev/null || true
           pkill -f Xvfb 2>/dev/null || true
+          pkill -x mihomo 2>/dev/null || true
           pkill -f sing-box 2>/dev/null || true
